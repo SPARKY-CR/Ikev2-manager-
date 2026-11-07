@@ -49,6 +49,8 @@ T = {
         "cap_win": "Windows: run in PowerShell as Administrator.",
         "cap_ca": "CA certificate (only needed for manual setups).",
         "cap_readme": "Setup instructions.",
+        "cap_zed": "ZedSecure: import links (copy from this file or from the message above).",
+        "zed_link": "🔗 <b>ZedSecure</b> — copy this link, then import it from the clipboard in the app:\n<code>{link}</code>",
         "user_view": "👤 <b>{user}</b>\nStatus: {state}\nOnline: {online}",
         "st_on": "enabled ✅", "st_off": "disabled ⛔", "yes": "yes", "no": "no",
         "b_profiles": "📲 Get profiles", "b_disable": "⛔ Disable", "b_enable": "✅ Enable",
@@ -123,6 +125,8 @@ T = {
         "cap_win": "ویندوز: در PowerShell با دسترسی Administrator اجرا کنید.",
         "cap_ca": "گواهی CA (فقط برای تنظیم دستی لازم است).",
         "cap_readme": "راهنمای نصب.",
+        "cap_zed": "ZedSecure: لینک‌های import (از این فایل یا از پیام بالا کپی کنید).",
+        "zed_link": "🔗 <b>ZedSecure</b> — این لینک را کپی کنید و در اپ از کلیپ‌بورد import کنید:\n<code>{link}</code>",
         "user_view": "👤 <b>{user}</b>\nوضعیت: {state}\nآنلاین: {online}",
         "st_on": "فعال ✅", "st_off": "غیرفعال ⛔", "yes": "بله", "no": "خیر",
         "b_profiles": "📲 دریافت پروفایل‌ها", "b_disable": "⛔ غیرفعال‌سازی", "b_enable": "✅ فعال‌سازی",
@@ -427,10 +431,14 @@ def send_profiles(name, with_info=True):
             send(tr("err", err=esc(out[-800:]))); return
         if with_info:
             send(tr("conn_info", server=esc(kv.get("server", "")), user=esc(name), pw=esc(password)))
+        rcz, zl = vpn("zed", name)
+        if rcz == 0 and zl.startswith("zedsecure://"):
+            send(tr("zed_link", link=esc(zl)))
         send(tr("sending_files"))
         caps = {
             f"{name}.sswan": "cap_sswan", f"{name}.mobileconfig": "cap_mobile",
-            f"{name}-windows.ps1": "cap_win", "ca.crt": "cap_ca", f"README-{name}.txt": "cap_readme",
+            f"{name}-windows.ps1": "cap_win", f"zedsecure-{name}.txt": "cap_zed", "ca.crt": "cap_ca",
+            f"README-{name}.txt": "cap_readme",
         }
         for fname, key in caps.items():
             path = os.path.join(tmp, fname)

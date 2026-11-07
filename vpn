@@ -518,6 +518,34 @@ Write-Host "Username: $name"
 EOF
 }
 
+zed_link() { # name [nopw]
+  local name="$1" pass cafile=""
+  pass=$(user_get "$name" 2); [[ ${2:-} == nopw ]] && pass=""
+  [[ $MODE == ip ]] && cafile="$PKI/ca.pem"
+  python3 "$OPT/ikev2lib.py" zedsecure "VPN $SERVER_NAME ($name)" "$SERVER_NAME" "$name" "$pass" "$cafile"
+}
+
+gen_zed_file() { # name pass
+  local name="$1" pass="$2"
+  cat <<EOF
+ZedSecure - IKEv2 import link
+=============================
+1) Copy the whole link below (long press > select all > copy).
+2) Open ZedSecure and import it from the clipboard.
+
+Link (includes the password):
+$(zed_link "$name")
+
+If ZedSecure does not accept the password inside the link, import this one
+and type the password yourself ($pass):
+$(zed_link "$name" nopw)
+
+Server:   $SERVER_NAME
+Username: $name
+$( [[ $MODE == ip ]] && echo "The CA certificate is embedded in the link (self-signed server certificate)." || echo "Public (Let's Encrypt) certificate: no CA needed." )
+EOF
+}
+
 gen_readme() { # name pass
   local name="$1" pass="$2"
   cat <<EOF
@@ -527,6 +555,8 @@ Server:   $SERVER_NAME
 Username: $name
 Password: $pass
 Type:     IKEv2 / EAP-MSCHAPv2
+
+ANDROID - ZedSecure: import the link inside zedsecure-$name.txt (clipboard).
 
 ANDROID (strongSwan VPN Client app, free on Google Play)
   1. Install the app, menu > "Import VPN profile", pick $name.sswan
@@ -557,6 +587,7 @@ profile_make() {
   gen_sswan "$name" >"$dir/$name.sswan"
   gen_mobileconfig "$name" "$pass" >"$dir/$name.mobileconfig"
   gen_windows_ps1 "$name" >"$dir/$name-windows.ps1"
+  gen_zed_file "$name" "$pass" >"$dir/zedsecure-$name.txt"
   gen_readme "$name" "$pass" >"$dir/README-$name.txt"
   [[ $MODE == ip ]] && cp -f "$PKI/ca.pem" "$dir/ca.crt"
   chmod 600 "$dir"/*
@@ -569,6 +600,14 @@ cmd_profile() {
   profile_make "$name" "$dir"
   ok "Profile files written to $dir"
   ls -1 "$dir"
+}
+
+cmd_zed() {
+  local name="${1:-}" mode="${2:-}"
+  [[ -n $name ]] || die "Usage: vpn zed NAME [--nopw]"
+  user_exists "$name" || die "No such user: $name"
+  cfg_load
+  zed_link "$name" "$([[ $mode == --nopw ]] && echo nopw)"
 }
 
 cmd_ca() {
@@ -1737,6 +1776,7 @@ tui_profile() { # name
     ui_item 1 "Show connection info (server / user / password)"
     ui_item 2 "Export profile files (Android, iPhone, Windows)"
     ui_item 3 "Show CA certificate text (to copy by hand)"
+    ui_item 4 "Show ZedSecure import link"
     ui_item 0 "Back"
     ui_choose
     case $CHOICE in
@@ -1751,6 +1791,11 @@ Download them from your computer, for example:
 Or just use the Telegram bot: it sends the files directly."
          else ui_show "$out"; fi ;;
       3) ui_show "$( (cmd_ca) 2>&1 )" ;;
+      4) ui_show "Copy the whole link and import it from the clipboard in ZedSecure:
+
+$( (cmd_zed "$name") 2>&1 )
+
+(Without password: vpn zed $name --nopw)" ;;
       0|"") return ;;
     esac
   done
@@ -1994,6 +2039,7 @@ Users
   vpn user list | add NAME [PASS] | del NAME | enable NAME | disable NAME
   vpn user passwd NAME [PASS] | show NAME
   vpn profile NAME [DIR]       write .sswan / .mobileconfig / windows script
+  vpn zed NAME [--nopw]        ZedSecure import link (zedsecure://...)
   vpn ca                       print CA certificate (IP mode)
 Server
   vpn status | online | restart | logs [N]
@@ -2032,6 +2078,7 @@ main() {
     user)               cmd_user "$@" ;;
     profile)            cmd_profile "$@" ;;
     ca)                 cmd_ca ;;
+    zed)                cmd_zed "$@" ;;
     restart)            cmd_restart ;;
     logs)               cmd_logs "$@" ;;
     cert)               cmd_cert "$@" ;;

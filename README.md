@@ -22,7 +22,7 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/SPARKY-CR/Ikev2-man
   --yes --user alice --firewall --fail2ban --autoupdate
 ```
 
-Or from a clone: `git clone https://github.com/SPARKY-CR/Ikev2-manager- && sudo bash Ikev2-manager-/install.sh --from Ikev2-manager-`
+Or from a clone: `git clone https://github.com/SPARKY-CR/Ikev2-manager- && sudo bash YOUR_REPO/install.sh --from YOUR_REPO`
 
 > Open **UDP 500** and **UDP 4500** (and TCP 80 for domain mode) in your cloud firewall / security group.
 
@@ -31,7 +31,7 @@ Or from a clone: `git clone https://github.com/SPARKY-CR/Ikev2-manager- && sudo 
 | Area | Features |
 |---|---|
 | Users | add / delete / enable / disable / change password, random strong passwords |
-| Profiles | `.sswan` (Android strongSwan app), `.mobileconfig` (iPhone/iPad/Mac), PowerShell script (Windows) |
+| Profiles | `.sswan` (Android strongSwan app), `zedsecure://` link ([ZedSecure](https://github.com/CluvexStudio/ZedSecure)), `.mobileconfig` (iPhone/iPad/Mac), PowerShell script (Windows) |
 | Modes | **IP mode** (own CA, no domain needed) or **domain mode** (Let's Encrypt, auto-renew) |
 | Tuning | DNS, client IP pool, split-tunnel routes, IKE/ESP proposals, DPD, MOBIKE, rekey/reauth timers, devices per user, MSS clamp, NAT, extra firewall ports, log level |
 | Raw access | add **any** strongSwan option via snippets (`vpn raw edit connection\|local\|remote\|child\|pools\|extra\|charon`) - validated, auto-rollback |
@@ -45,6 +45,7 @@ Or from a clone: `git clone https://github.com/SPARKY-CR/Ikev2-manager- && sudo 
 sudo vpn                          text menu
 vpn user add|del|list|enable|disable|passwd NAME
 vpn profile NAME                  write profile files
+vpn zed NAME [--nopw]             ZedSecure import link
 vpn get [KEY] / vpn set KEY VALUE / vpn reset
 vpn preset dns cloudflare|google|quad9|adguard|cloudflare-family|opendns
 vpn raw list|show|edit|set|clear NAME
@@ -82,7 +83,7 @@ Maintainers: bump `VERSION`, regenerate `SHA256SUMS` (`sha256sum vpn bot.py ikev
 
 ## فارسی (خلاصه)
 
-نصب با یک دستور:
+نصب با یک دستور (جای `SPARKY-CR/Ikev2-manager-` را عوض کنید):
 
 ```bash
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/SPARKY-CR/Ikev2-manager-/main/install.sh)"

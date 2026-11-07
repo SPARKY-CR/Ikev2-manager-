@@ -5,7 +5,10 @@ CLI:
   ikev2lib.py online [--json]   list connected clients
   ikev2lib.py count             number of connected clients
   ikev2lib.py kick NAME         terminate all sessions of user NAME
+  ikev2lib.py zedsecure NAME SERVER USER PASSWORD [CA_PEM_FILE] [MTU]
+                                print a ZedSecure import link (zedsecure://...)
 """
+import base64
 import json
 import re
 import subprocess
@@ -106,6 +109,36 @@ def fmt_dur(secs):
     return f"{s}s"
 
 
+def zedsecure_link(name, server, username, password, ca_pem="", mtu=1400):
+    """Build a ZedSecure IKEv2 share link: zedsecure:// + base64(compact JSON).
+
+    Format (reverse-engineered from an exported link): {"v":1,"n":name,"s":{"kind":"ikev2",
+    "settings":{server, remoteId, localId, authType, username, password, psk, caCertPem,
+    userCertAlias, ikeProposal, espProposal, mtu}},"m":[]}.
+    JSON allows whitespace, so we pad it until the base64 has no '=' padding and no '+' or '/'
+    (these only appear for the bytes > ? ~ DEL), which makes standard and URL-safe base64 identical.
+    """
+    obj = {
+        "v": 1, "n": name,
+        "s": {"kind": "ikev2", "settings": {
+            "server": server, "remoteId": "", "localId": "", "authType": "eap_mschapv2",
+            "username": username, "password": password, "psk": "", "caCertPem": ca_pem,
+            "userCertAlias": "", "ikeProposal": "", "espProposal": "", "mtu": int(mtu)}},
+        "m": [],
+    }
+    raw = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    first = None
+    for lead in range(3):
+        body = "{" + " " * lead + raw[1:]
+        body += " " * ((-len(body.encode())) % 3)
+        enc = base64.b64encode(body.encode()).decode()
+        if first is None:
+            first = enc
+        if "+" not in enc and "/" not in enc:
+            return "zedsecure://" + enc
+    return "zedsecure://" + first.rstrip("=")
+
+
 def main(argv):
     if len(argv) < 2:
         print(__doc__)
@@ -125,6 +158,14 @@ def main(argv):
         return 0
     if cmd == "kick" and len(argv) > 2:
         print(kick(argv[2]))
+        return 0
+    if cmd == "zedsecure" and len(argv) >= 6:
+        ca = ""
+        if len(argv) > 6 and argv[6]:
+            with open(argv[6], encoding="utf-8") as f:
+                ca = f.read().strip()
+        mtu = argv[7] if len(argv) > 7 else 1400
+        print(zedsecure_link(argv[2], argv[3], argv[4], argv[5], ca, mtu))
         return 0
     print(__doc__)
     return 1

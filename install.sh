@@ -4,9 +4,9 @@
 # Downloads the tool files from GitHub (or --from DIR), verifies SHA256SUMS, installs.
 set -uo pipefail
 
-# Where the files come from. Replace YOUR_USER/YOUR_REPO with your GitHub repo
+# Where the files come from. Replace SPARKY-CR/Ikev2-manager- with your GitHub repo
 # (or export IKEV2MGR_BASE / IKEV2MGR_REPO before running).
-IKEV2MGR_REPO="${IKEV2MGR_REPO:-YOUR_USER/YOUR_REPO}"
+IKEV2MGR_REPO="${IKEV2MGR_REPO:-SPARKY-CR/Ikev2-manager-}"
 IKEV2MGR_BRANCH="${IKEV2MGR_BRANCH:-main}"
 BASE="${IKEV2MGR_BASE:-https://raw.githubusercontent.com/$IKEV2MGR_REPO/$IKEV2MGR_BRANCH}"
 FILES=(vpn bot.py ikev2lib.py VERSION)
@@ -49,7 +49,7 @@ fetch_payload() { # destdir
     done
     return 0
   fi
-  if [[ $BASE == *YOUR_USER/YOUR_REPO* ]]; then
+  if [[ $BASE == *SPARKY-CR/Ikev2-manager-* ]]; then
     echo "This installer has no download source yet."
     echo "Set it:  IKEV2MGR_REPO=youruser/yourrepo sudo -E bash install.sh"
     echo "or use a cloned repo:  sudo bash install.sh --from /path/to/repo"
@@ -153,7 +153,7 @@ NEW_VERSION=$(tr -d '[:space:]' <"$TMP/VERSION")
 
 # ------------------------------------------------------------------ upgrade path
 if [[ $UPGRADE == 1 ]]; then
-  if [[ -z $FROM_DIR && $BASE != *YOUR_USER/YOUR_REPO* ]]; then ( . "$TMP/vpn"; cfg_set UPDATE_BASE "$BASE" ) 2>/dev/null; fi
+  if [[ -z $FROM_DIR && $BASE != *SPARKY-CR/Ikev2-manager-* ]]; then ( . "$TMP/vpn"; cfg_set UPDATE_BASE "$BASE" ) 2>/dev/null; fi
   do_upgrade "$TMP"; exit $?
 fi
 
@@ -256,7 +256,7 @@ ARGS=(setup --mode "$MODE" --user "$USER_NAME" --firewall "${FW:-no}" --fail2ban
 [[ -n $IP ]]     && ARGS+=(--ip "$IP")
 [[ -n $PASS ]]   && ARGS+=(--pass "$PASS")
 [[ -n $TOKEN && -n $ADMIN ]] && ARGS+=(--bot-token "$TOKEN" --admin-id "$ADMIN")
-[[ -z $FROM_DIR && $BASE != *YOUR_USER/YOUR_REPO* ]] && ARGS+=(--update-base "$BASE")
+[[ -z $FROM_DIR && $BASE != *SPARKY-CR/Ikev2-manager-* ]] && ARGS+=(--update-base "$BASE")
 
 "$BIN" "${ARGS[@]}"
 rc=$?
