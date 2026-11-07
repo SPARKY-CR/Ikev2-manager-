@@ -9,7 +9,7 @@ client profiles for Android / iPhone / Windows, full strongSwan tuning, and an
 On a fresh Ubuntu/Debian server (as a sudo user):
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/install.sh)"
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/SPARKY-CR/Ikev2-manager-/main/install.sh)"
 ```
 
 A text wizard asks: IP-only or domain (Let's Encrypt), first user, firewall, fail2ban,
@@ -18,7 +18,7 @@ automatic security updates, Telegram bot. Afterwards run `sudo vpn` for the menu
 Non-interactive example:
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/install.sh)" -- \
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/SPARKY-CR/Ikev2-manager-/main/install.sh)" -- \
   --yes --user alice --firewall --fail2ban --autoupdate
 ```
 
