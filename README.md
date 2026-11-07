@@ -82,10 +82,10 @@ Maintainers: bump `VERSION`, regenerate `SHA256SUMS` (`sha256sum vpn bot.py ikev
 
 ## فارسی (خلاصه)
 
-نصب با یک دستور (جای `YOUR_USER/YOUR_REPO` را عوض کنید):
+نصب با یک دستور:
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/install.sh)"
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/SPARKY-CR/Ikev2-manager-/main/install.sh)"
 ```
 
 بعد از نصب `sudo vpn` منوی مدیریت را باز می‌کند: کاربران، پروفایل‌ها (اندروید/آیفون/ویندوز)، تنظیمات
