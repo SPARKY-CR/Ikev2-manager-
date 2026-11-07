@@ -22,7 +22,7 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/SPARKY-CR/Ikev2-man
   --yes --user alice --firewall --fail2ban --autoupdate
 ```
 
-Or from a clone: `git clone https://github.com/YOUR_USER/YOUR_REPO && sudo bash YOUR_REPO/install.sh --from YOUR_REPO`
+Or from a clone: `git clone https://github.com/SPARKY-CR/Ikev2-manager- && sudo bash Ikev2-manager-/install.sh --from Ikev2-manager-`
 
 > Open **UDP 500** and **UDP 4500** (and TCP 80 for domain mode) in your cloud firewall / security group.
 
