@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+echo "sysctl $*" >>"${STUB_STATE:-/tmp}/calls.log" 2>/dev/null; exit 0

@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+import json, os, sys
+sd = os.environ.get("STUB_STATE", "/tmp/stub"); os.makedirs(sd, exist_ok=True)
+args = sys.argv[1:]; url = None; out = None; cfg = ""; i = 0
+while i < len(args):
+    a = args[i]
+    if a in ("-o", "--output"): out = args[i + 1]; i += 2; continue
+    if a in ("-K", "--config"):
+        data = sys.stdin.read() if args[i + 1] == "-" else open(args[i + 1]).read()
+        cfg += data
+        for line in data.splitlines():
+            if line.strip().startswith("url"): url = line.split("=", 1)[1].strip().strip('"')
+        i += 2; continue
+    if a in ("--max-time", "--proto", "--proto-redir", "-d", "--data", "--data-urlencode", "-F", "-H", "-m", "--connect-timeout", "--retry", "-w"):
+        i += 2; continue
+    if a.startswith("-"): i += 1; continue
+    url = a; i += 1
+with open(os.path.join(sd, "curl.log"), "a") as f:
+    f.write(json.dumps({"argv": args, "cfg": cfg, "url": url}) + "\n")
+if url is None: sys.exit(2)
+body = None
+if url.startswith("file://"):
+    p = url[7:]
+    if not os.path.exists(p): sys.exit(37)
+    body = open(p, "rb").read()
+elif url.startswith("https://api.telegram.org/"):
+    if os.environ.get("STUB_TG_BAD"): body = b'{"ok":false}'
+    elif "getMe" in url: body = b'{"ok":true,"result":{"username":"stub_bot"}}'
+    else: body = b'{"ok":true,"result":{"message_id":1}}'
+elif url.startswith("https://") and os.environ.get("STUB_HTTPS_MAP"):
+    prefix, _, d = os.environ["STUB_HTTPS_MAP"].partition("=")
+    if url.startswith(prefix + "/"):
+        p = os.path.join(d, url[len(prefix) + 1:])
+        if not os.path.exists(p): sys.exit(22)
+        body = open(p, "rb").read()
+if body is None: sys.exit(6)
+if out: open(out, "wb").write(body)
+else: sys.stdout.buffer.write(body)

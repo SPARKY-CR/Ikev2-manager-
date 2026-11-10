@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# `ss -H -ltn 'sport = :80'` -> nothing listening; anything else -> sshd on :22
+case "$*" in *":80"*) exit 0 ;; esac
+echo 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=1,fd=3))'

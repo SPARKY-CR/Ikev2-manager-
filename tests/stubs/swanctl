@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+echo "swanctl $*" >>"${STUB_STATE:-/tmp}/calls.log" 2>/dev/null
+case "${1:-}" in
+  --list-sas) [[ -f ${STUB_SAS_FILE:-} ]] && cat "$STUB_SAS_FILE" ;;
+  --terminate) exit 0 ;;
+esac
+exit 0

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+echo "ip $*" >>"${STUB_STATE:-/tmp}/calls.log" 2>/dev/null
+case "$*" in
+  *"route show default"*) echo "default via 10.0.0.1 dev eth0 proto dhcp src 10.0.0.5 metric 100" ;;
+esac
+exit 0

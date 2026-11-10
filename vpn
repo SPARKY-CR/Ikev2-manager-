@@ -1,0 +1,2622 @@
+#!/usr/bin/env bash
+# vpn - IKEv2 (strongSwan) manager: CLI + TUI
+# Part of ikev2-manager.
+set -uo pipefail
+
+ETC="${IKEV2_ETC:-/etc/ikev2}"
+VAR="${IKEV2_VAR:-/var/lib/ikev2}"
+OPT="${IKEV2_OPT:-/opt/ikev2}"
+SWAN="${IKEV2_SWAN:-/etc/swanctl}"
+BACKUPS="${IKEV2_BACKUPS:-/var/backups/ikev2}"
+EXPORTS="${IKEV2_EXPORTS:-/root/ikev2-profiles}"
+CONF="$ETC/config.env"
+USERS="$ETC/users.db"
+PKI="$ETC/pki"
+LOGFILE="${IKEV2_LOG:-/var/log/ikev2-manager.log}"
+SYSCTL_D="${IKEV2_SYSCTL_D:-/etc/sysctl.d}"
+UNIT_DIR="${IKEV2_UNIT_DIR:-/etc/systemd/system}"
+F2B_D="${IKEV2_F2B_D:-/etc/fail2ban/jail.d}"
+APT_D="${IKEV2_APT_D:-/etc/apt/apt.conf.d}"
+BIN_PATH="${IKEV2_BIN:-/usr/local/bin/vpn}"
+LE_DIR="${IKEV2_LE:-/etc/letsencrypt}"
+BACKUP_PUB="$ETC/backup-cert.pem"   # certificate used to encrypt backups; the PRIVATE key is never kept on the server
+RELEASE_PUB="$ETC/release.pub"      # pinned release-signing key (updates must be signed by it)
+VERSION="$(cat "$OPT/VERSION" 2>/dev/null || echo dev)"
+TESTMODE="${IKEV2_TEST:-0}"
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+
+
+# ---- defaults for every tunable setting (empty value in config.env = default)
+D_UPDATE_BASE='https://raw.githubusercontent.com/SPARKY-CR/Ikev2-manager-/main'
+D_POOL='10.30.0.0/16'
+D_DNS='1.1.1.1,8.8.8.8'
+D_LOCAL_TS='0.0.0.0/0'
+D_IKE_PROPOSALS='default,aes256-sha256-modp2048,aes128-sha256-modp2048,aes256-sha1-modp2048,aes128-sha1-modp2048'
+D_ESP_PROPOSALS='default,aes256-sha256-modp2048,aes128-sha256-modp2048,aes256-sha256,aes128-sha256,aes256gcm16,aes128gcm16'
+D_DPD_DELAY='30s'
+D_FRAGMENTATION='yes'
+D_MOBIKE='yes'
+D_UNIQUE='no'
+D_SEND_CERT='always'
+D_MSS_CLAMP='pmtu'
+D_NAT='yes'
+D_LOG_LEVEL='default'
+D_CLIENT_ISOLATION='yes'
+D_BLOCK_PRIVATE='yes'
+D_IKE_RATE_LIMIT='off'
+D_IPV6_BLOCK='no'
+
+NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$'
+PASS_RE='^[A-Za-z0-9._@+=,!%^*~-]{12,64}$'          # new passwords
+DOMAIN_RE='^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,}$'
+EMAIL_RE='^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
+PASS_MSG="Invalid password. Use 12-64 chars: letters, digits and . _ @ + = , ! % ^ * ~ -"
+
+# ------------------------------------------------------------ output helpers
+c()    { if [[ -t 1 ]]; then printf '\e[%sm' "$1"; fi; }
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s%s%s\n' "$(c 32)" "$*" "$(c 0)"; }
+warn() { printf '%s%s%s\n' "$(c 33)" "$*" "$(c 0)" >&2; }
+err()  { printf '%s%s%s\n' "$(c 31)" "Error: $*" "$(c 0)" >&2; }
+die()  { err "$*"; exit 1; }
+step() { printf '%s==>%s %s\n' "$(c 36)" "$(c 0)" "$*"; log "STEP $*"; }
+log()  { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOGFILE" 2>/dev/null || true; }
+
+need_root() {
+  [[ $TESTMODE == 1 || $EUID -eq 0 ]] || die "Run as root: sudo vpn"
+}
+
+# ------------------------------------------------------------ system wrappers
+run_swanctl() {
+  [[ $TESTMODE == 1 ]] && return 0
+  local out rc
+  out=$(swanctl "$@" 2>&1); rc=$?
+  printf '%s\n' "$out" | grep -Ev "^plugin '|CAP_SETUID|^$" || true
+  return $rc
+}
+
+svc_name() {
+  local u
+  for u in strongswan-swanctl strongswan; do
+    if systemctl cat "$u.service" 2>/dev/null | grep -q charon-systemd; then
+      echo "$u"; return
+    fi
+  done
+  echo strongswan
+}
+
+svc_active() {
+  [[ $TESTMODE == 1 ]] && { echo active; return; }
+  systemctl is-active "$(svc_name)" 2>/dev/null || true
+}
+
+svc_restart() {
+  [[ $TESTMODE == 1 ]] && return 0
+  systemctl restart "$(svc_name)"
+}
+
+apt_install() {
+  [[ $TESTMODE == 1 ]] && return 0
+  export DEBIAN_FRONTEND=noninteractive
+  if ! apt-get install -y "$@" >>"$LOGFILE" 2>&1; then
+    tail -n 15 "$LOGFILE" >&2
+    die "apt-get install failed: $*"
+  fi
+}
+
+# ------------------------------------------------------------ config
+# config.env is PARSED (never sourced) and only these keys are read from it.
+CFG_KEYS=" MODE SERVER_NAME SERVER_IP IFACE DOMAIN CA_CN BOT_TOKEN ADMIN_ID EMAIL FIREWALL FW_SSH_PORTS UPDATE_BASE FAIL2BAN AUTOUPDATE POOL DNS LOCAL_TS IKE_PROPOSALS ESP_PROPOSALS DPD_DELAY FRAGMENTATION MOBIKE UNIQUE REKEY_TIME REAUTH_TIME CHILD_REKEY_TIME CHILD_LIFE_TIME SEND_CERT MSS_CLAMP NAT FW_EXTRA_TCP FW_EXTRA_UDP LOG_LEVEL CLIENT_ISOLATION BLOCK_PRIVATE IKE_RATE_LIMIT IPV6_BLOCK "
+
+cfg_load() {
+  MODE=""; SERVER_NAME=""; SERVER_IP=""; IFACE=""; DOMAIN=""; CA_CN=""; BOT_TOKEN=""; ADMIN_ID=""
+  EMAIL=""; FIREWALL=""; FW_SSH_PORTS=""; UPDATE_BASE=""; FAIL2BAN=""; AUTOUPDATE=""
+  POOL=""; DNS=""; LOCAL_TS=""; IKE_PROPOSALS=""; ESP_PROPOSALS=""; DPD_DELAY=""; FRAGMENTATION=""
+  MOBIKE=""; UNIQUE=""; REKEY_TIME=""; REAUTH_TIME=""; CHILD_REKEY_TIME=""; CHILD_LIFE_TIME=""
+  SEND_CERT=""; MSS_CLAMP=""; NAT=""; FW_EXTRA_TCP=""; FW_EXTRA_UDP=""; LOG_LEVEL=""
+  CLIENT_ISOLATION=""; BLOCK_PRIVATE=""; IKE_RATE_LIMIT=""; IPV6_BLOCK=""
+  if [[ -f $CONF ]]; then
+    local _line _k _v
+    while IFS= read -r _line || [[ -n $_line ]]; do
+      [[ $_line =~ ^([A-Z][A-Z0-9_]*)=\'(.*)\'$ ]] || continue
+      _k="${BASH_REMATCH[1]}"; _v="${BASH_REMATCH[2]}"
+      [[ $CFG_KEYS == *" $_k "* ]] || continue
+      _v="${_v//\'\\\'\'/\'}"
+      printf -v "$_k" '%s' "$_v"
+    done <"$CONF"
+  fi
+  : "${MODE:=ip}" "${CA_CN:=IKEv2 VPN CA}" "${FIREWALL:=no}" "${FW_SSH_PORTS:=22}"
+  : "${POOL:=$D_POOL}" "${DNS:=$D_DNS}" "${LOCAL_TS:=$D_LOCAL_TS}" "${IKE_PROPOSALS:=$D_IKE_PROPOSALS}"
+  : "${ESP_PROPOSALS:=$D_ESP_PROPOSALS}" "${DPD_DELAY:=$D_DPD_DELAY}" "${FRAGMENTATION:=$D_FRAGMENTATION}"
+  : "${MOBIKE:=$D_MOBIKE}" "${UNIQUE:=$D_UNIQUE}" "${SEND_CERT:=$D_SEND_CERT}" "${MSS_CLAMP:=$D_MSS_CLAMP}"
+  : "${NAT:=$D_NAT}" "${LOG_LEVEL:=$D_LOG_LEVEL}" "${UPDATE_BASE:=$D_UPDATE_BASE}"
+  : "${CLIENT_ISOLATION:=$D_CLIENT_ISOLATION}" "${BLOCK_PRIVATE:=$D_BLOCK_PRIVATE}"
+  : "${IKE_RATE_LIMIT:=$D_IKE_RATE_LIMIT}" "${IPV6_BLOCK:=$D_IPV6_BLOCK}"
+}
+
+# ---- global lock: every command that changes state runs under it (re-entrant, 120 s timeout)
+_LOCK_FD=""
+locked() { # locked CMD [ARGS...]
+  if [[ -n $_LOCK_FD ]] || ! command -v flock >/dev/null 2>&1; then "$@"; return $?; fi
+  mkdir -p "$ETC" 2>/dev/null
+  # NB: the 2>/dev/null must wrap a group - on a bare `exec` it would redirect this shell's stderr for good
+  if ! { exec {_LOCK_FD}>>"$ETC/.lock"; } 2>/dev/null; then _LOCK_FD=""; "$@"; return $?; fi
+  if ! flock -w "${IKEV2_LOCK_TIMEOUT:-120}" "$_LOCK_FD"; then
+    exec {_LOCK_FD}>&-; _LOCK_FD=""
+    err "another vpn command is still running (waited ${IKEV2_LOCK_TIMEOUT:-120} s)"; return 1
+  fi
+  local _rc=0
+  "$@" || _rc=$?
+  exec {_LOCK_FD}>&-; _LOCK_FD=""
+  return $_rc
+}
+
+# cfg_set KEY VALUE : atomic write; refuses control characters (they would corrupt the file)
+cfg_set() { locked _cfg_set "$@"; }
+_cfg_set() {
+  local k="$1" v="$2" t
+  [[ $k =~ ^[A-Z][A-Z0-9_]*$ ]] || { err "bad config key: $k"; return 1; }
+  [[ $v != *[[:cntrl:]]* ]] || { err "the value of $k must not contain line breaks or control characters"; return 1; }
+  mkdir -p "$ETC"
+  [[ -f $CONF ]] || { : >"$CONF"; chmod 600 "$CONF"; }
+  t=$(mktemp "$CONF.XXXXXX") || return 1
+  { grep -v "^${k}=" "$CONF" || true; printf "%s='%s'\n" "$k" "${v//\'/\'\\\'\'}"; } >"$t" || { rm -f "$t"; return 1; }
+  chmod 600 "$t"; mv -f "$t" "$CONF"
+}
+
+# cfg_raw KEY : the value stored in config.env for KEY (empty when unset) - no defaults applied
+cfg_raw() {
+  local _line _out=""
+  [[ -f $CONF ]] || return 0
+  while IFS= read -r _line || [[ -n $_line ]]; do
+    if [[ $_line =~ ^$1=\'(.*)\'$ ]]; then _out="${BASH_REMATCH[1]}"; _out="${_out//\'\\\'\'/\'}"; fi
+  done <"$CONF"
+  printf '%s' "$_out"
+}
+
+# ------------------------------------------------------------ users db
+# format: name:password:status:created_epoch      (all writes are atomic and run under the lock)
+users_ensure() { mkdir -p "$ETC"; [[ -f $USERS ]] || : >"$USERS"; chmod 600 "$USERS"; }
+user_exists()  { [[ -f $USERS ]] && n="$1" awk -F: '$1==ENVIRON["n"]{f=1} END{exit !f}' "$USERS"; }
+user_get()     { n="$1" f="$2" awk -F: '$1==ENVIRON["n"]{print $(ENVIRON["f"]+0); exit}' "$USERS"; }
+user_count()   { [[ -f $USERS ]] && awk 'END{print NR}' "$USERS" || echo 0; }
+user_enabled_count() { [[ -f $USERS ]] && awk -F: '$3=="enabled"{n++} END{print n+0}' "$USERS" || echo 0; }
+
+user_set() { # NAME FIELD VALUE
+  local t; t=$(mktemp "$USERS.XXXXXX") || return 1
+  if n="$1" f="$2" v="$3" awk -F: -v OFS=: '$1==ENVIRON["n"]{$(ENVIRON["f"]+0)=ENVIRON["v"]}1' "$USERS" >"$t"; then
+    chmod 600 "$t"; mv -f "$t" "$USERS"
+  else rm -f "$t"; return 1; fi
+}
+
+user_remove() {
+  local t; t=$(mktemp "$USERS.XXXXXX") || return 1
+  if n="$1" awk -F: '$1!=ENVIRON["n"]' "$USERS" >"$t"; then chmod 600 "$t"; mv -f "$t" "$USERS"
+  else rm -f "$t"; return 1; fi
+}
+
+# snapshot/rollback of the whole DB (used when swanctl refuses the new config)
+users_snapshot() { local t; t=$(mktemp "$USERS.snap.XXXXXX") || return 1; cat "$USERS" >"$t"; chmod 600 "$t"; printf '%s' "$t"; }
+users_restore()  { [[ -f ${1:-} ]] && mv -f "$1" "$USERS"; }
+users_discard()  { [[ -n ${1:-} ]] && rm -f "$1"; return 0; }
+
+# pass_check NAME PASSWORD -> 0 when acceptable, else 1 with the reason in $PASS_ERR
+pass_check() {
+  local n="${1,,}" p="$2" lp="${2,,}" core w
+  PASS_ERR=""
+  if ! [[ $p =~ $PASS_RE ]]; then PASS_ERR="$PASS_MSG"; return 1; fi
+  if [[ $(fold -w1 <<<"$p" | sort -u | wc -l) -le 3 ]]; then PASS_ERR="Password is too weak (too few different characters)."; return 1; fi
+  if [[ "01234567890123456789012345678901234567890123456789 abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz qwertyuiopasdfghjklzxcvbnmqwertyuiop" == *"$lp"* ]]; then
+    PASS_ERR="Password is too weak (a simple sequence)."; return 1
+  fi
+  if [[ ${#n} -ge 3 && $lp == *"$n"* ]]; then PASS_ERR="Password must not contain the username."; return 1; fi
+  core="${lp//[^a-z]/}"
+  for w in password passw0rd qwerty qwertyuiop letmein welcome admin administrator changeme iloveyou vpn secret login master monkey dragon football baseball; do
+    if [[ $core == "$w" && ${#lp} -le $(( ${#w} + 6 )) ]]; then PASS_ERR="Password is too common."; return 1; fi
+  done
+  return 0
+}
+
+gen_pass() { openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | cut -c1-16; }
+gen_strong_pass() { # NAME : a generated password that also satisfies pass_check
+  local i p
+  for i in 1 2 3 4 5 6 7 8; do p=$(gen_pass); pass_check "$1" "$p" && { printf '%s' "$p"; return 0; }; done
+  printf '%s' "$p"
+}
+
+kick_user() {
+  [[ $TESTMODE == 1 ]] && return 0
+  python3 "$OPT/ikev2lib.py" kick "$1" >/dev/null 2>&1 || true
+}
+
+# ------------------------------------------------------------ swanctl.conf
+# snip NAME INDENT : print custom raw snippet (if any) indented
+snip() {
+  local f="$ETC/custom/$1.conf"
+  [[ -s $f ]] || return 0
+  sed "s/^/$2/" "$f"
+}
+# opt INDENT KEY VALUE : print "KEY = VALUE" only when VALUE is not empty
+opt() { [[ -n $3 ]] && printf '%s%s = %s\n' "$1" "$2" "$3"; return 0; }
+
+rebuild_conf() {
+  cfg_load; users_ensure
+  [[ -n $SERVER_NAME ]] || die "Server is not configured yet (run the installer)."
+  local new="$SWAN/swanctl.conf.new" cur="$SWAN/swanctl.conf" out lts="$LOCAL_TS"
+  mkdir -p "$SWAN"
+  # optional: also route ::/0 into the tunnel (the server forwards no IPv6, so it is black-holed instead of leaking)
+  if [[ $IPV6_BLOCK == yes && ,$LOCAL_TS, == *,0.0.0.0/0,* ]]; then lts="$LOCAL_TS,::/0"; fi
+  {
+    cat <<EOF
+# Generated by ikev2-manager v$VERSION - do not edit by hand.
+# Use 'vpn' (menu) or 'vpn set KEY VALUE' / 'vpn raw edit NAME'.
+connections {
+  rw {
+    version = 2
+    pools = rw_pool
+    send_cert = $SEND_CERT
+    send_certreq = no
+    fragmentation = $FRAGMENTATION
+    mobike = $MOBIKE
+    dpd_delay = $DPD_DELAY
+    unique = $UNIQUE
+$(opt '    ' rekey_time "$REKEY_TIME")
+$(opt '    ' reauth_time "$REAUTH_TIME")
+    proposals = $IKE_PROPOSALS
+$(snip connection '    ')
+    local {
+      auth = pubkey
+      certs = server.pem
+      id = $SERVER_NAME
+$(snip local '      ')
+    }
+    remote {
+      auth = eap-mschapv2
+      eap_id = %any
+$(snip remote '      ')
+    }
+    children {
+      net {
+        local_ts = $lts
+        esp_proposals = $ESP_PROPOSALS
+$(opt '        ' rekey_time "$CHILD_REKEY_TIME")
+$(opt '        ' life_time "$CHILD_LIFE_TIME")
+$(snip child '        ')
+      }
+    }
+  }
+}
+pools {
+  rw_pool {
+    addrs = $POOL
+    dns = $DNS
+$(snip pools '    ')
+  }
+}
+secrets {
+EOF
+    # only well-formed lines become secrets (no regex intervals: mawk 1.3.4-2020 does not support them)
+    awk -F: 'NF==4 && $3=="enabled" && length($1)<=32 && $1 ~ /^[A-Za-z0-9][A-Za-z0-9_.-]*$/ &&
+             length($2)>=8 && length($2)<=64 && $2 ~ /^[A-Za-z0-9._@+=,!%^*~-]+$/ {
+      n++; printf "  eap-%d {\n    id = %s\n    secret = \"%s\"\n  }\n", n, $1, $2 }' "$USERS"
+    echo "}"
+    snip extra ''
+  } | sed '/^[[:space:]]*$/d' >"$new"
+  chmod 600 "$new"
+  [[ -f $cur ]] && { cp -f "$cur" "$cur.bak"; chmod 600 "$cur.bak"; }
+  mv -f "$new" "$cur"
+  if [[ $TESTMODE == 1 ]]; then
+    # test hook: pretend swanctl rejects any config containing $IKEV2_TEST_FAIL
+    if [[ -n ${IKEV2_TEST_FAIL:-} ]] && grep -q -- "$IKEV2_TEST_FAIL" "$cur"; then
+      err "swanctl --load-all failed: (simulated) $IKEV2_TEST_FAIL"
+      [[ -f $cur.bak ]] && cp -f "$cur.bak" "$cur"
+      return 1
+    fi
+  elif ! out=$(run_swanctl --load-all); then
+    err "swanctl --load-all failed:"; printf '%s\n' "$out" >&2
+    [[ -f $cur.bak ]] && { cp -f "$cur.bak" "$cur"; run_swanctl --load-all >/dev/null; warn "Previous config restored."; }
+    return 1
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------ user commands
+cmd_user_list() {
+  users_ensure
+  if [[ ${1:-} == --plain ]]; then
+    awk -F: '{printf "%s|%s|%s\n", $1, $3, $4}' "$USERS"
+    return
+  fi
+  if [[ $(user_count) -eq 0 ]]; then say "No users yet. Add one: vpn user add NAME"; return; fi
+  printf '%-20s %-9s %s\n' USER STATUS CREATED
+  local n p s cr d
+  while IFS=: read -r n p s cr; do
+    [[ $cr =~ ^[0-9]+$ ]] && d=$(date -d "@$cr" +%F 2>/dev/null) || d="-"
+    printf '%-20s %-9s %s\n' "$n" "$s" "$d"
+  done <"$USERS"
+}
+
+cmd_user_add() { need_root; locked _user_add "$@"; }
+_user_add() {
+  local name="${1:-}" pass="" plain=0 stdin=0 a snap
+  [[ -n $name ]] || die "Usage: vpn user add NAME [PASSWORD | --stdin] [--plain]"
+  shift
+  for a in "$@"; do case "$a" in --plain) plain=1 ;; --stdin) stdin=1 ;; *) pass="$a" ;; esac; done
+  [[ $stdin == 1 ]] && { IFS= read -r pass || true; }
+  [[ $name =~ $NAME_RE ]] || die "Invalid username. Use letters, digits, '_', '.', '-' (max 32 chars)."
+  users_ensure
+  user_exists "$name" && die "User '$name' already exists."
+  [[ -n $pass ]] || pass=$(gen_strong_pass "$name")
+  pass_check "$name" "$pass" || die "$PASS_ERR"
+  snap=$(users_snapshot) || die "Could not snapshot users.db"
+  printf '%s:%s:enabled:%s\n' "$name" "$pass" "$(date +%s)" >>"$USERS"
+  if ! rebuild_conf; then
+    users_restore "$snap"
+    die "Could not apply the configuration - the user was NOT created. See: vpn logs"
+  fi
+  users_discard "$snap"
+  log "user added: $name"
+  if [[ $plain == 1 ]]; then printf '%s\n' "$pass"; else
+    ok "User created."; say "  Username: $name"; say "  Password: $pass"
+  fi
+}
+
+cmd_user_del() { need_root; locked _user_del "$@"; }
+_user_del() {
+  local name="${1:-}" snap
+  [[ -n $name ]] || die "Usage: vpn user del NAME"
+  user_exists "$name" || die "No such user: $name"
+  snap=$(users_snapshot) || die "Could not snapshot users.db"
+  user_remove "$name" || { users_restore "$snap"; die "Could not update users.db"; }
+  if ! rebuild_conf; then
+    users_restore "$snap"
+    die "Could not apply the configuration - user '$name' was NOT deleted and is STILL ACTIVE. Fix the error above (vpn logs / vpn raw) and retry."
+  fi
+  users_discard "$snap"
+  kick_user "$name"
+  log "user deleted: $name"; ok "User '$name' deleted."
+}
+
+cmd_user_setstatus() { need_root; locked _user_setstatus "$@"; }
+_user_setstatus() {
+  local name="${1:-}" st="$2" snap
+  [[ -n $name ]] || die "Usage: vpn user enable|disable NAME"
+  user_exists "$name" || die "No such user: $name"
+  snap=$(users_snapshot) || die "Could not snapshot users.db"
+  user_set "$name" 3 "$st" || { users_restore "$snap"; die "Could not update users.db"; }
+  if ! rebuild_conf; then
+    users_restore "$snap"
+    die "Could not apply the configuration - user '$name' was NOT changed (still $([[ $st == disabled ]] && echo ACTIVE || echo disabled)). Fix the error above (vpn logs / vpn raw) and retry."
+  fi
+  users_discard "$snap"
+  [[ $st == disabled ]] && kick_user "$name"
+  log "user $name -> $st"; ok "User '$name' is now $st."
+}
+
+cmd_user_passwd() { need_root; locked _user_passwd "$@"; }
+_user_passwd() {
+  local name="${1:-}" pass="" plain=0 stdin=0 a snap
+  [[ -n $name ]] || die "Usage: vpn user passwd NAME [PASSWORD | auto | --stdin] [--plain]"
+  shift
+  for a in "$@"; do case "$a" in --plain) plain=1 ;; --stdin) stdin=1 ;; *) pass="$a" ;; esac; done
+  [[ $stdin == 1 ]] && { IFS= read -r pass || true; }
+  user_exists "$name" || die "No such user: $name"
+  [[ -n $pass && $pass != auto ]] || pass=$(gen_strong_pass "$name")
+  pass_check "$name" "$pass" || die "$PASS_ERR"
+  snap=$(users_snapshot) || die "Could not snapshot users.db"
+  user_set "$name" 2 "$pass" || { users_restore "$snap"; die "Could not update users.db"; }
+  if ! rebuild_conf; then
+    users_restore "$snap"
+    die "Could not apply the configuration - the password of '$name' was NOT changed. See: vpn logs"
+  fi
+  users_discard "$snap"
+  kick_user "$name"
+  log "password changed: $name"
+  if [[ $plain == 1 ]]; then printf '%s\n' "$pass"; else ok "Password changed."; say "  New password: $pass"; fi
+}
+
+cmd_user_show() {
+  local name="${1:-}"
+  [[ -n $name ]] || die "Usage: vpn user show NAME"
+  user_exists "$name" || die "No such user: $name"
+  cfg_load
+  say "Server:   $SERVER_NAME"
+  say "Username: $name"
+  say "Password: $(user_get "$name" 2)"
+  say "Status:   $(user_get "$name" 3)"
+  say "Type:     IKEv2 (EAP-MSCHAPv2)"
+}
+
+cmd_user() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    list|ls)          cmd_user_list "$@" ;;
+    add)              cmd_user_add "$@" ;;
+    del|rm|delete)    cmd_user_del "$@" ;;
+    enable)           cmd_user_setstatus "${1:-}" enabled ;;
+    disable)          cmd_user_setstatus "${1:-}" disabled ;;
+    passwd|password)  cmd_user_passwd "$@" ;;
+    show)             cmd_user_show "$@" ;;
+    *) die "Usage: vpn user list|add|del|enable|disable|passwd|show" ;;
+  esac
+}
+
+# ------------------------------------------------------------ PKI / certificates
+pki_init_ca() {
+  cfg_load
+  mkdir -p "$PKI"; chmod 700 "$PKI"
+  if [[ ! -f $PKI/ca.key || ! -f $PKI/ca.pem ]]; then
+    (
+      umask 077
+      pki --gen --type rsa --size 3072 --outform pem >"$PKI/ca.key"
+    ) || die "pki --gen failed (is strongswan-pki installed?)"
+    chmod 600 "$PKI/ca.key"
+    # pathlen 0: this CA may only sign end-entity certificates, never another CA.
+    # (older pki builds that do not know --pathlen fall back to the previous behaviour)
+    if ! pki --self --ca --pathlen 0 --lifetime 3652 --in "$PKI/ca.key" --dn "CN=$CA_CN" --outform pem >"$PKI/ca.pem" 2>/dev/null; then
+      warn "pki rejected --pathlen; creating the CA without a path-length constraint."
+      pki --self --ca --lifetime 3652 --in "$PKI/ca.key" --dn "CN=$CA_CN" --outform pem >"$PKI/ca.pem" \
+        || die "pki --self failed"
+    fi
+    chmod 644 "$PKI/ca.pem"
+  fi
+}
+
+# issue server cert for NAME (IP or domain) signed by our CA
+pki_issue_server() {
+  local name="$1" t
+  t=$(mktemp -d) || die "mktemp failed"
+  chmod 700 "$t"
+  if ! (
+    umask 077
+    pki --gen --type rsa --size 3072 --outform pem >"$t/key.pem" &&
+    pki --req --type priv --in "$t/key.pem" --dn "CN=$name" --san "$name" --outform pem >"$t/req.pem" &&
+    pki --issue --cacert "$PKI/ca.pem" --cakey "$PKI/ca.key" --type pkcs10 --in "$t/req.pem" \
+        --lifetime 1826 --flag serverAuth --flag ikeIntermediate --outform pem >"$t/cert.pem"
+  ); then
+    rm -rf "$t"; die "certificate generation failed (is strongswan-pki installed?)"
+  fi
+  mkdir -p "$SWAN/x509" "$SWAN/x509ca" "$SWAN/private"
+  install -m 644 "$t/cert.pem" "$SWAN/x509/server.pem"
+  install -m 600 "$t/key.pem"  "$SWAN/private/server.key"
+  install -m 644 "$PKI/ca.pem" "$SWAN/x509ca/ikev2-ca.pem"
+  rm -rf "$t"
+}
+
+# whole days until the server certificate expires (floor; NEGATIVE once it has expired); "none" when absent/unreadable
+cert_days_left() {
+  local f="$SWAN/x509/server.pem" end e r
+  [[ -f $f ]] || { echo none; return; }
+  end=$(openssl x509 -enddate -noout -in "$f" 2>/dev/null | cut -d= -f2)
+  [[ -n $end ]] || { echo none; return; }
+  e=$(date -d "$end" +%s 2>/dev/null) || { echo none; return; }
+  r=$(( e - $(date +%s) ))
+  if (( r >= 0 )); then echo $(( r / 86400 )); else echo $(( -( (-r + 86399) / 86400 ) )); fi
+}
+
+# ok | expiring (<= 14 days) | expired | missing
+cert_state() {
+  local d; d=$(cert_days_left)
+  if [[ $d == none ]]; then echo missing
+  elif (( d < 0 )); then echo expired
+  elif (( d <= 14 )); then echo expiring
+  else echo ok; fi
+}
+
+ca_der_b64() { openssl x509 -in "$PKI/ca.pem" -outform DER | base64 -w0; }
+
+# ------------------------------------------------------------ client profiles
+uuid4() { cat /proc/sys/kernel/random/uuid; }
+
+gen_sswan() { # name pass
+  local name="$1" cert_line="" id_line=""
+  if [[ $MODE == ip ]]; then
+    cert_line=",
+    \"cert\": \"$(ca_der_b64)\""
+  else
+    id_line=",
+    \"id\": \"$SERVER_NAME\""
+  fi
+  cat <<EOF
+{
+  "uuid": "$(uuid4)",
+  "name": "VPN $SERVER_NAME ($name)",
+  "type": "ikev2-eap",
+  "remote": {
+    "addr": "$SERVER_NAME"$id_line$cert_line
+  },
+  "local": {
+    "eap_id": "$name"
+  },
+  "split-tunneling": {
+    "block-ipv6": true
+  }
+}
+EOF
+}
+
+gen_mobileconfig() { # name pass
+  local name="$1" pass="$2" issuer_cn="" ca_payload=""
+  if [[ $MODE == ip ]]; then
+    issuer_cn="
+        <key>ServerCertificateIssuerCommonName</key>
+        <string>$CA_CN</string>"
+    ca_payload="
+    <dict>
+      <key>PayloadIdentifier</key>
+      <string>com.ikev2mgr.ca.$name</string>
+      <key>PayloadUUID</key>
+      <string>$(uuid4)</string>
+      <key>PayloadType</key>
+      <string>com.apple.security.root</string>
+      <key>PayloadVersion</key>
+      <integer>1</integer>
+      <key>PayloadDisplayName</key>
+      <string>$CA_CN</string>
+      <key>PayloadContent</key>
+      <data>$(ca_der_b64)</data>
+    </dict>"
+  fi
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>PayloadDisplayName</key>
+  <string>VPN $SERVER_NAME ($name)</string>
+  <key>PayloadIdentifier</key>
+  <string>com.ikev2mgr.profile.$name</string>
+  <key>PayloadUUID</key>
+  <string>$(uuid4)</string>
+  <key>PayloadType</key>
+  <string>Configuration</string>
+  <key>PayloadVersion</key>
+  <integer>1</integer>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>PayloadIdentifier</key>
+      <string>com.ikev2mgr.profile.$name.vpn</string>
+      <key>PayloadUUID</key>
+      <string>$(uuid4)</string>
+      <key>PayloadType</key>
+      <string>com.apple.vpn.managed</string>
+      <key>PayloadVersion</key>
+      <integer>1</integer>
+      <key>UserDefinedName</key>
+      <string>VPN $SERVER_NAME</string>
+      <key>VPNType</key>
+      <string>IKEv2</string>
+      <key>IKEv2</key>
+      <dict>
+        <key>RemoteAddress</key>
+        <string>$SERVER_NAME</string>
+        <key>RemoteIdentifier</key>
+        <string>$SERVER_NAME</string>
+        <key>LocalIdentifier</key>
+        <string></string>$issuer_cn
+        <key>ServerCertificateCommonName</key>
+        <string>$SERVER_NAME</string>
+        <key>AuthenticationMethod</key>
+        <string>Certificate</string>
+        <key>ExtendedAuthEnabled</key>
+        <integer>1</integer>
+        <key>AuthName</key>
+        <string>$name</string>
+        <key>AuthPassword</key>
+        <string>$pass</string>
+        <key>DeadPeerDetectionRate</key>
+        <string>Medium</string>
+        <key>IKESecurityAssociationParameters</key>
+        <dict>
+          <key>EncryptionAlgorithm</key>
+          <string>AES-256</string>
+          <key>IntegrityAlgorithm</key>
+          <string>SHA2-256</string>
+          <key>DiffieHellmanGroup</key>
+          <integer>14</integer>
+          <key>LifeTimeInMinutes</key>
+          <integer>1440</integer>
+        </dict>
+        <key>ChildSecurityAssociationParameters</key>
+        <dict>
+          <key>EncryptionAlgorithm</key>
+          <string>AES-256</string>
+          <key>IntegrityAlgorithm</key>
+          <string>SHA2-256</string>
+          <key>DiffieHellmanGroup</key>
+          <integer>14</integer>
+          <key>LifeTimeInMinutes</key>
+          <integer>1440</integer>
+        </dict>
+      </dict>
+    </dict>$ca_payload
+  </array>
+</dict>
+</plist>
+EOF
+}
+
+gen_windows_ps1() { # name
+  local name="$1" import=""
+  if [[ $MODE == ip ]]; then
+    import="
+# Trust the VPN CA certificate
+\$certB64 = \"$(ca_der_b64)\"
+\$tmp = Join-Path \$env:TEMP \"ikev2-ca.cer\"
+[IO.File]::WriteAllBytes(\$tmp, [Convert]::FromBase64String(\$certB64))
+Import-Certificate -FilePath \$tmp -CertStoreLocation Cert:\\LocalMachine\\Root | Out-Null
+Remove-Item \$tmp
+"
+  fi
+  cat <<EOF
+# IKEv2 VPN setup for Windows. Run in PowerShell *as Administrator*.
+# Username: $name  (you will be asked for the password on first connect)
+\$ErrorActionPreference = "Stop"
+\$Name = "VPN $SERVER_NAME"
+\$Server = "$SERVER_NAME"
+$import
+Add-VpnConnection -Name \$Name -ServerAddress \$Server -TunnelType IKEv2 \`
+  -AuthenticationMethod MSChapv2 -EncryptionLevel Required -RememberCredential -Force
+Set-VpnConnectionIPsecConfiguration -ConnectionName \$Name \`
+  -AuthenticationTransformConstants SHA256128 -CipherTransformConstants AES128 \`
+  -EncryptionMethod AES128 -IntegrityCheckMethod SHA256 -PfsGroup None -DHGroup Group14 -Force
+
+Write-Host "Done. Connect via Settings > Network & Internet > VPN > \$Name"
+Write-Host "Username: $name"
+EOF
+}
+
+zed_link() { # name [nopw]
+  local name="$1" pass cafile=""
+  pass=$(user_get "$name" 2); [[ ${2:-} == nopw ]] && pass=""
+  [[ $MODE == ip ]] && cafile="$PKI/ca.pem"
+  IKEV2_ZED_PASS="$pass" python3 "$OPT/ikev2lib.py" zedsecure "VPN $SERVER_NAME ($name)" "$SERVER_NAME" "$name" "$cafile"
+}
+
+gen_zed_file() { # name pass
+  local name="$1" pass="$2"
+  cat <<EOF
+ZedSecure - IKEv2 import link
+=============================
+1) Copy the whole link below (long press > select all > copy).
+2) Open ZedSecure and import it from the clipboard.
+
+Link (includes the password):
+$(zed_link "$name")
+
+If ZedSecure does not accept the password inside the link, import this one
+and type the password yourself ($pass):
+$(zed_link "$name" nopw)
+
+Server:   $SERVER_NAME
+Username: $name
+$( [[ $MODE == ip ]] && echo "The CA certificate is embedded in the link (self-signed server certificate)." || echo "Public (Let's Encrypt) certificate: no CA needed." )
+EOF
+}
+
+gen_readme() { # name pass
+  local name="$1" pass="$2"
+  cat <<EOF
+IKEv2 VPN - connection info
+===========================
+Server:   $SERVER_NAME
+Username: $name
+Password: $pass
+Type:     IKEv2 / EAP-MSCHAPv2
+
+ANDROID - ZedSecure: import the link inside zedsecure-$name.txt (clipboard).
+
+ANDROID (strongSwan VPN Client app, free on Google Play)
+  1. Install the app, menu > "Import VPN profile", pick $name.sswan
+  2. Enter the password above (the file does not contain it), tap Import.
+$( [[ $MODE == ip ]] && echo "  (The CA certificate is embedded in the profile.)" )
+
+IPHONE / IPAD / MAC
+  1. Open $name.mobileconfig and install it (Settings > Profile Downloaded).
+$( [[ $MODE == ip ]] && echo "  2. Settings > General > About > Certificate Trust Settings: enable full trust for \"$CA_CN\".
+  3. Settings > VPN: turn the VPN on." || echo "  2. Settings > VPN: turn the VPN on." )
+
+WINDOWS
+  Run $name-windows.ps1 in PowerShell as Administrator, then connect from
+  Settings > Network & Internet > VPN.
+
+PRIVACY NOTE (IPv6)
+  This VPN tunnels IPv4. If your Wi-Fi/mobile network also gives you IPv6, some
+  apps may reach the internet over IPv6 outside the tunnel. The Android profile
+  (.sswan) blocks IPv6; on other devices turn IPv6 off for your network if that
+  matters to you (or ask the server admin about: vpn set IPV6_BLOCK yes).
+$( [[ $MODE == ip ]] && echo "
+Manual setups: install ca.crt as a trusted root CA first." )
+EOF
+}
+
+# profile_make NAME DIR
+# Files are created 0600 from the start (umask) and ONLY the files written here are touched,
+# so pointing DIR at an existing folder never changes the permissions of unrelated files.
+profile_make() {
+  local name="$1" dir="$2" pass f
+  cfg_load
+  [[ -n $SERVER_NAME ]] || die "Server is not configured."
+  user_exists "$name" || die "No such user: $name"
+  pass=$(user_get "$name" 2)
+  [[ -d $dir ]] || install -d -m 700 "$dir" || die "Cannot create $dir"
+  (
+    umask 077
+    gen_sswan "$name" >"$dir/$name.sswan" &&
+    gen_mobileconfig "$name" "$pass" >"$dir/$name.mobileconfig" &&
+    gen_windows_ps1 "$name" >"$dir/$name-windows.ps1" &&
+    gen_zed_file "$name" "$pass" >"$dir/zedsecure-$name.txt" &&
+    gen_readme "$name" "$pass" >"$dir/README-$name.txt" &&
+    { [[ $MODE != ip ]] || cp -f "$PKI/ca.pem" "$dir/ca.crt"; }
+  ) || die "Could not write the profile files to $dir"
+  for f in "$name.sswan" "$name.mobileconfig" "$name-windows.ps1" "zedsecure-$name.txt" "README-$name.txt" ca.crt; do
+    [[ -f $dir/$f ]] && chmod 600 "$dir/$f"
+  done
+  return 0
+}
+
+cmd_profile() {
+  local name="${1:-}" dir="${2:-}"
+  [[ -n $name ]] || die "Usage: vpn profile NAME [OUTPUT_DIR]"
+  [[ -n $dir ]] || dir="$EXPORTS/$name"
+  profile_make "$name" "$dir"
+  ok "Profile files written to $dir"
+  local f
+  for f in "$name.sswan" "$name.mobileconfig" "$name-windows.ps1" "zedsecure-$name.txt" "README-$name.txt" ca.crt; do
+    [[ -f $dir/$f ]] && echo "$f"
+  done
+  return 0
+}
+
+cmd_zed() {
+  local name="${1:-}" mode="${2:-}"
+  [[ -n $name ]] || die "Usage: vpn zed NAME [--nopw]"
+  user_exists "$name" || die "No such user: $name"
+  cfg_load
+  zed_link "$name" "$([[ $mode == --nopw ]] && echo nopw)"
+}
+
+cmd_ca() {
+  cfg_load
+  [[ $MODE == ip ]] || die "Domain mode uses a public certificate (Let's Encrypt); no CA file is needed."
+  cat "$PKI/ca.pem"
+}
+
+# ------------------------------------------------------------ network / firewall
+default_iface() { ip -4 route show default 2>/dev/null | awk '{print $5; exit}'; }
+
+detect_public_ip() {
+  local ip u
+  for u in https://ifconfig.me https://api.ipify.org https://ipv4.icanhazip.com; do
+    ip=$(curl -4 -s --max-time 8 "$u" 2>/dev/null | tr -d '[:space:]')
+    if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then echo "$ip"; return 0; fi
+  done
+  return 1
+}
+
+IPT_TAG=(-m comment --comment ikev2-mgr)
+
+# ipt_purge TABLE CHAIN [iptables|ip6tables] : delete every rule we tagged ("ikev2-mgr")
+ipt_purge() {
+  local cmd="${3:-iptables}" line arr
+  command -v "$cmd" >/dev/null 2>&1 || return 0
+  while IFS= read -r line; do
+    [[ $line == *ikev2-mgr* ]] || continue
+    read -ra arr <<<"$line"; arr[0]=-D
+    "$cmd" -t "$1" "${arr[@]}" 2>/dev/null
+  done < <("$cmd" -t "$1" -S "$2" 2>/dev/null | grep -- '^-A ')
+  return 0
+}
+
+fw_ssh_ports() {
+  {
+    ss -H -tlnp 2>/dev/null | awk '/sshd/{n=split($4,a,":"); print a[n]}'
+    awk 'tolower($1)=="port" && $2 ~ /^[0-9]+$/ {print $2}' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null
+    [[ -n ${SSH_CONNECTION:-} ]] && echo "${SSH_CONNECTION##* }"
+    echo 22
+  } | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ' | sed 's/ $//'
+}
+
+fw_remove() {
+  local cmd
+  for cmd in iptables ip6tables; do
+    command -v "$cmd" >/dev/null || continue
+    while "$cmd" -C INPUT -j IKEV2_FW 2>/dev/null; do "$cmd" -D INPUT -j IKEV2_FW; done
+    "$cmd" -F IKEV2_FW 2>/dev/null; "$cmd" -X IKEV2_FW 2>/dev/null
+  done
+  return 0
+}
+
+fw_apply() {
+  cfg_load
+  if [[ $FIREWALL != yes ]]; then fw_remove; return 0; fi
+  local cmd p icmp
+  for cmd in iptables ip6tables; do
+    command -v "$cmd" >/dev/null || continue
+    "$cmd" -N IKEV2_FW 2>/dev/null || "$cmd" -F IKEV2_FW
+    "$cmd" -A IKEV2_FW -i lo -j ACCEPT
+    "$cmd" -A IKEV2_FW -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    if [[ $cmd == iptables ]]; then icmp="icmp"; else icmp="ipv6-icmp"; fi
+    "$cmd" -A IKEV2_FW -p "$icmp" -j ACCEPT
+    for p in $FW_SSH_PORTS; do "$cmd" -A IKEV2_FW -p tcp --dport "$p" -j ACCEPT; done
+    ike_limit_rule "$cmd" "-A IKEV2_FW"
+    "$cmd" -A IKEV2_FW -p udp -m multiport --dports 500,4500 -j ACCEPT
+    "$cmd" -A IKEV2_FW -p esp -j ACCEPT
+    if [[ $cmd == iptables ]]; then
+      "$cmd" -A IKEV2_FW -p udp --sport 67 --dport 68 -j ACCEPT
+    else
+      "$cmd" -A IKEV2_FW -p udp --dport 546 -j ACCEPT
+    fi
+    for p in ${FW_EXTRA_TCP//,/ }; do "$cmd" -A IKEV2_FW -p tcp --dport "$p" -j ACCEPT; done
+    for p in ${FW_EXTRA_UDP//,/ }; do "$cmd" -A IKEV2_FW -p udp --dport "$p" -j ACCEPT; done
+    "$cmd" -A IKEV2_FW -j DROP
+    "$cmd" -C INPUT -j IKEV2_FW 2>/dev/null || "$cmd" -I INPUT 1 -j IKEV2_FW
+  done
+}
+
+# ike_limit_rule CMD "POSITION ARGS" [extra rule args...] : brake on brand-new IKE handshakes (UDP/500) per source IP.
+# Only IKE_SA_INIT arrives on 500 (the rest of an established session lives on 4500), so normal
+# clients are never affected, but a password-guessing script needs one handshake per guess.
+ike_limit_rule() {
+  local cmd="$1" n="$IKE_RATE_LIMIT" name="ike2init4"
+  local -a posargs
+  read -ra posargs <<<"$2"; shift 2
+  [[ $n =~ ^[0-9]+$ ]] || return 0
+  [[ $cmd == ip6tables ]] && name="ike2init6"
+  "$cmd" "${posargs[@]}" "$@" -p udp --dport 500 -m hashlimit --hashlimit-name "$name" --hashlimit-mode srcip \
+      --hashlimit-above "${n}/minute" --hashlimit-burst "$n" -j DROP 2>/dev/null \
+    || warn "$cmd: could not add the IKE rate limit (hashlimit match unavailable?) - continuing without it."
+  return 0
+}
+
+fwd_chain_drop() { # the tagged jump from FORWARD has already been purged
+  iptables -F IKEV2_FWD 2>/dev/null; iptables -X IKEV2_FWD 2>/dev/null; return 0
+}
+
+# What VPN clients may do once they are inside (first match wins):
+#   1. never reach link-local space (cloud metadata service 169.254.169.254 ...)
+#   2. client <-> client traffic: dropped (CLIENT_ISOLATION=yes) or allowed
+#   3. the DNS servers we push and the routes we push (split tunnel) stay reachable
+#   4. private networks behind the server (RFC1918, CGNAT) are off limits (BLOCK_PRIVATE=yes)
+#   5. everything else from clients is forwarded; with NAT only replies may come back in
+fwd_chain_apply() {
+  local c=IKEV2_FWD x r
+  iptables -N "$c" 2>/dev/null || iptables -F "$c"
+  iptables -A "$c" -s "$POOL" -d 169.254.0.0/16 -j DROP
+  if [[ $CLIENT_ISOLATION == yes ]]; then
+    iptables -A "$c" -s "$POOL" -d "$POOL" -j DROP
+  else
+    iptables -A "$c" -s "$POOL" -d "$POOL" -j ACCEPT
+  fi
+  for x in ${DNS//,/ }; do iptables -A "$c" -s "$POOL" -d "$x" -j ACCEPT; done
+  for x in ${LOCAL_TS//,/ }; do
+    [[ $x == 0.0.0.0/0 ]] && continue
+    iptables -A "$c" -s "$POOL" -d "$x" -j ACCEPT
+  done
+  if [[ $BLOCK_PRIVATE == yes ]]; then
+    for r in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10; do
+      iptables -A "$c" -s "$POOL" -d "$r" -j DROP
+    done
+  fi
+  iptables -A "$c" -s "$POOL" -j ACCEPT
+  if [[ $NAT == yes ]]; then
+    iptables -A "$c" -d "$POOL" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+  else
+    iptables -A "$c" -d "$POOL" -j ACCEPT
+  fi
+  iptables -I FORWARD 1 "${IPT_TAG[@]}" -j "$c"
+}
+
+net_apply() { need_root; locked _net_apply; }
+_net_apply() {
+  cfg_load
+  mkdir -p "$SYSCTL_D"
+  cat >"$SYSCTL_D/99-ikev2.conf" <<EOF
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.all.send_redirects=0
+EOF
+  sysctl -q --system >/dev/null 2>&1 || sysctl -q -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  local ifc cmd; ifc=$(default_iface); [[ -n $ifc ]] || ifc="${IFACE:-eth0}"
+  ipt_purge nat POSTROUTING; ipt_purge filter FORWARD; ipt_purge mangle FORWARD; ipt_purge filter INPUT
+  ipt_purge filter FORWARD ip6tables; ipt_purge filter INPUT ip6tables
+  fwd_chain_drop
+  if [[ $NAT == yes ]]; then
+    iptables -t nat -A POSTROUTING -s "$POOL" -o "$ifc" "${IPT_TAG[@]}" -j MASQUERADE
+  fi
+  fwd_chain_apply
+  case "$MSS_CLAMP" in
+    off) ;;
+    pmtu) iptables -t mangle -A FORWARD -s "$POOL" -p tcp -m tcp --tcp-flags SYN,RST SYN "${IPT_TAG[@]}" -j TCPMSS --clamp-mss-to-pmtu ;;
+    *)    iptables -t mangle -A FORWARD -s "$POOL" -p tcp -m tcp --tcp-flags SYN,RST SYN "${IPT_TAG[@]}" -j TCPMSS --set-mss "$MSS_CLAMP" ;;
+  esac
+  iptables -I INPUT 1 -p udp -m multiport --dports 500,4500 "${IPT_TAG[@]}" -j ACCEPT
+  if [[ $FIREWALL != yes ]]; then   # with the firewall on, the limit lives inside IKEV2_FW (see fw_apply)
+    for cmd in iptables ip6tables; do
+      command -v "$cmd" >/dev/null 2>&1 || continue
+      ike_limit_rule "$cmd" "-I INPUT 1" "${IPT_TAG[@]}"
+    done
+  fi
+  # IPv6 guard: nothing that arrives through IPsec may be forwarded as IPv6
+  if [[ $IPV6_BLOCK == yes ]] && command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -I FORWARD 1 -m policy --dir in --pol ipsec "${IPT_TAG[@]}" -j DROP 2>/dev/null \
+      || warn "ip6tables: could not add the IPv6 guard rule (policy match unavailable?)"
+  fi
+  fw_apply
+}
+
+net_clear() {
+  cfg_load
+  ipt_purge nat POSTROUTING; ipt_purge filter FORWARD; ipt_purge mangle FORWARD; ipt_purge filter INPUT
+  ipt_purge filter FORWARD ip6tables; ipt_purge filter INPUT ip6tables
+  fwd_chain_drop
+  fw_remove
+}
+
+cmd_fw() { need_root; locked _fw "$@"; }
+_fw() {
+  cfg_load
+  case "${1:-status}" in
+    on)
+      local ports; ports=$(fw_ssh_ports)
+      cfg_set FW_SSH_PORTS "$ports"; cfg_set FIREWALL yes
+      _net_apply; ok "Firewall enabled. Open inbound: TCP $ports (SSH), UDP 500/4500 (VPN)."
+      [[ $MODE == domain ]] && say "Port 80 is opened automatically only while Let's Encrypt renews."
+      warn "Cloud providers (AWS etc.) also have their own firewall (Security Group) - keep it in sync." ;;
+    off)  cfg_set FIREWALL no; _net_apply; ok "Firewall disabled." ;;
+    ports)
+      [[ -n ${2:-} ]] || die "Usage: vpn fw ports \"22 2222\""
+      [[ $2 =~ ^[0-9]+( [0-9]+)*$ ]] && v_ports "$2" || die "Ports must be numbers between 1 and 65535, separated by spaces."
+      cfg_set FW_SSH_PORTS "$2"; _net_apply; ok "SSH ports set to: $2" ;;
+    status)
+      say "Firewall: $FIREWALL (SSH ports: $FW_SSH_PORTS)"
+      iptables -S IKEV2_FW 2>/dev/null || say "(no IKEV2_FW chain active)"
+      say "Client forwarding policy (IKEV2_FWD):"
+      iptables -S IKEV2_FWD 2>/dev/null || say "(no IKEV2_FWD chain active)" ;;
+    *) die "Usage: vpn fw on|off|status|ports" ;;
+  esac
+}
+
+# ------------------------------------------------------------ security extras
+sec_fail2ban() {
+  need_root
+  step "Installing fail2ban"
+  apt_install fail2ban
+  cfg_load
+  mkdir -p "$F2B_D"
+  cat >"$F2B_D/ikev2.local" <<EOF
+[DEFAULT]
+bantime = 1h
+findtime = 10m
+maxretry = 5
+
+[sshd]
+enabled = true
+port = $(echo "$FW_SSH_PORTS" | tr ' ' ',')
+EOF
+  if [[ $TESTMODE != 1 ]]; then
+    systemctl enable fail2ban >/dev/null 2>&1 || true
+    systemctl restart fail2ban || warn "fail2ban failed to start; check: journalctl -u fail2ban"
+  fi
+  cfg_set FAIL2BAN yes
+  ok "fail2ban enabled for SSH."
+}
+
+sec_autoupdate() {
+  need_root
+  step "Enabling automatic security updates"
+  apt_install unattended-upgrades
+  mkdir -p "$APT_D"
+  cat >"$APT_D/20auto-upgrades" <<EOF
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+  cfg_set AUTOUPDATE yes
+  ok "Automatic security updates enabled."
+}
+
+cmd_security() {
+  case "${1:-}" in
+    fail2ban)   sec_fail2ban ;;
+    autoupdate) sec_autoupdate ;;
+    *) die "Usage: vpn security fail2ban|autoupdate" ;;
+  esac
+}
+
+# ------------------------------------------------------------ certificates: IP / domain
+dns_check() { # domain -> 0 ok, 1 mismatch, 2 no record
+  local d="$1" ip
+  ip=$(getent ahostsv4 "$d" 2>/dev/null | awk 'NR==1{print $1}')
+  [[ -n $ip ]] || return 2
+  [[ $ip == "$SERVER_IP" ]] || return 1
+}
+
+le_hooks() {
+  mkdir -p "$ETC/hooks"
+  cat >"$ETC/hooks/pre.sh" <<'EOF'
+#!/bin/sh
+# open port 80 for Let's Encrypt (HTTP-01)
+for c in iptables ip6tables; do
+  command -v $c >/dev/null 2>&1 || continue
+  $c -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || $c -I INPUT 1 -p tcp --dport 80 -j ACCEPT
+done
+exit 0
+EOF
+  cat >"$ETC/hooks/post.sh" <<'EOF'
+#!/bin/sh
+for c in iptables ip6tables; do
+  command -v $c >/dev/null 2>&1 || continue
+  while $c -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null; do $c -D INPUT -p tcp --dport 80 -j ACCEPT; done
+done
+exit 0
+EOF
+  chmod 755 "$ETC/hooks/pre.sh" "$ETC/hooks/post.sh"
+}
+
+le_issue() { # domain email
+  local d="$1" email="${2:-}" args
+  step "Requesting Let's Encrypt certificate for $d"
+  apt_install certbot
+  le_hooks
+  if ss -H -ltn 'sport = :80' 2>/dev/null | grep -q .; then
+    die "Port 80 is in use on this server; Let's Encrypt (standalone) needs it free."
+  fi
+  args=(certonly --standalone -d "$d" --non-interactive --agree-tos --preferred-challenges http
+        --pre-hook "$ETC/hooks/pre.sh" --post-hook "$ETC/hooks/post.sh"
+        --deploy-hook "$SELF cert deploy")
+  if [[ -n $email ]]; then args+=(-m "$email"); else args+=(--register-unsafely-without-email); fi
+  if certbot --help certonly 2>/dev/null | grep -q -- '--key-type'; then args+=(--key-type rsa); fi
+  certbot "${args[@]}" || die "certbot failed. Check: DNS A record -> this server, port 80 open in your cloud firewall."
+  cmd_cert_deploy "$d"
+}
+
+cmd_cert_deploy() {
+  local d="${1:-}"; cfg_load
+  if [[ -z $d ]]; then          # called by certbot's deploy hook (no argument): only act while in domain mode
+    d="${DOMAIN:-}"
+    if [[ -z $d || $MODE != domain ]]; then say "Not in domain mode - nothing to deploy."; return 0; fi
+  fi
+  local live="$LE_DIR/live/$d"
+  [[ -f $live/cert.pem ]] || die "No Let's Encrypt certificate found for $d"
+  mkdir -p "$SWAN/x509" "$SWAN/x509ica" "$SWAN/private"
+  cp -L "$live/cert.pem"    "$SWAN/x509/server.pem"
+  cp -L "$live/chain.pem"   "$SWAN/x509ica/le-chain.pem"
+  cp -L "$live/privkey.pem" "$SWAN/private/server.key"
+  chmod 644 "$SWAN/x509/server.pem" "$SWAN/x509ica/le-chain.pem"; chmod 600 "$SWAN/private/server.key"
+  run_swanctl --load-creds >/dev/null 2>&1 || true
+  log "LE cert deployed for $d"
+}
+
+mode_setup_ip() { # ip
+  local ip="$1"
+  cfg_set MODE ip; cfg_set SERVER_IP "$ip"; cfg_set SERVER_NAME "$ip"; cfg_set DOMAIN ""
+  pki_init_ca
+  step "Issuing server certificate for $ip"
+  pki_issue_server "$ip"
+  rm -f "$SWAN/x509ica/le-chain.pem"
+}
+
+mode_setup_domain() { # domain email
+  local d="$1" email="${2:-}"
+  cfg_load
+  if [[ $TESTMODE != 1 ]]; then
+    dns_check "$d"; case $? in
+      2) die "'$d' has no A record yet. Create an A record pointing to $SERVER_IP and wait a few minutes." ;;
+      1) die "'$d' does not point to this server ($SERVER_IP). Fix the A record first." ;;
+    esac
+  fi
+  le_issue "$d" "$email"
+  cfg_set MODE domain; cfg_set DOMAIN "$d"; cfg_set SERVER_NAME "$d"; cfg_set EMAIL "$email"
+  rm -f "$SWAN/x509ca/ikev2-ca.pem"
+}
+
+cmd_domain() { need_root; locked _domain "$@"; }
+_domain() {
+  case "${1:-}" in
+    set)
+      local d="${2:-}" email="${3:-}"
+      [[ $d =~ $DOMAIN_RE ]] || die "Usage: vpn domain set DOMAIN [EMAIL]"
+      [[ -z $email || $email =~ $EMAIL_RE ]] || die "Invalid email address."
+      cfg_load
+      [[ -n $SERVER_IP ]] || SERVER_IP=$(detect_public_ip) || die "Cannot detect public IP."
+      cfg_set SERVER_IP "$SERVER_IP"
+      mode_setup_domain "$d" "$email"
+      rebuild_conf || die "Config reload failed."
+      warn "Server address changed to $d. Re-send profiles to your clients (they must use the new address)."
+      ok "Switched to domain mode: $d" ;;
+    unset)
+      cfg_load
+      [[ $MODE == domain ]] || die "Already in IP mode."
+      local ip; ip=$(detect_public_ip) || die "Cannot detect public IP."
+      mode_setup_ip "$ip"; rebuild_conf || die "Config reload failed."
+      warn "Server address changed to $ip. Re-send profiles; clients must trust the CA again."
+      ok "Switched to IP mode: $ip" ;;
+    *) die "Usage: vpn domain set DOMAIN [EMAIL] | vpn domain unset" ;;
+  esac
+}
+
+cmd_ip() { need_root; locked _ip "$@"; }
+_ip() {
+  [[ ${1:-} == refresh ]] || die "Usage: vpn ip refresh"
+  cfg_load
+  [[ $MODE == ip ]] || die "Only for IP mode. In domain mode just update your DNS A record."
+  local ip; ip=$(detect_public_ip) || die "Cannot detect public IP."
+  if [[ $ip == "$SERVER_NAME" ]]; then ok "Public IP unchanged ($ip)."; return; fi
+  say "IP changed: $SERVER_NAME -> $ip"
+  mode_setup_ip "$ip"; rebuild_conf || die "Config reload failed."
+  warn "Re-send profiles to clients (new server address)."
+}
+
+cmd_cert() {
+  # anything that rewrites certificates runs under the global lock (certbot's deploy hook included)
+  case "${1:-info}" in
+    renew|deploy|auto) [[ -n $_LOCK_FD ]] || { locked cmd_cert "$@"; return $?; } ;;
+  esac
+  cfg_load
+  case "${1:-info}" in
+    info)
+      say "Mode: $MODE   Server: $SERVER_NAME"
+      say "State: $(cert_state)   Days left: $(cert_days_left)"
+      openssl x509 -in "$SWAN/x509/server.pem" -noout -subject -issuer -enddate 2>/dev/null ;;
+    renew)
+      need_root
+      if [[ $MODE == ip ]]; then
+        pki_init_ca; pki_issue_server "$SERVER_NAME"; run_swanctl --load-creds >/dev/null 2>&1
+        ok "Server certificate re-issued (CA unchanged, clients keep working)."
+      else
+        local f=""; [[ ${2:-} == --force ]] && f="--force-renewal"
+        certbot renew $f --deploy-hook "$SELF cert deploy" || die "certbot renew failed"
+        ok "Renewal finished."
+      fi ;;
+    auto)
+      need_root
+      # a missing or already EXPIRED certificate is renewed too (negative day counts used to be skipped)
+      local d; d=$(cert_days_left)
+      if [[ $MODE == ip ]]; then
+        if [[ $d == none ]] || (( d < 30 )); then cmd_cert renew; fi
+      else
+        if [[ $d == none ]] || (( d < 10 )); then cmd_cert renew; fi
+      fi ;;
+    deploy) cmd_cert_deploy ;;
+    *) die "Usage: vpn cert info|renew [--force]|auto|deploy" ;;
+  esac
+}
+
+# ------------------------------------------------------------ strongSwan package upgrade
+sw_version() {
+  local v
+  v=$(swanctl --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.~+-]*' | head -1)
+  [[ -n $v ]] || v=$(dpkg-query -W -f='${Version}' charon-systemd 2>/dev/null)
+  echo "${v:-unknown}"
+}
+
+cmd_upgrade_strongswan() {
+  need_root
+  local old new
+  old=$(sw_version)
+  step "Updating strongSwan packages via apt (current: $old)"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update >>"$LOGFILE" 2>&1 || warn "apt-get update reported errors (see $LOGFILE)"
+  apt-get install -y --only-upgrade strongswan strongswan-swanctl strongswan-pki charon-systemd \
+    libcharon-extra-plugins libcharon-extauth-plugins libstrongswan libstrongswan-standard-plugins \
+    libstrongswan-extra-plugins libcharon-standard-plugins >>"$LOGFILE" 2>&1 \
+    || { tail -n 12 "$LOGFILE" >&2; die "apt upgrade failed"; }
+  systemctl disable --now strongswan-starter >/dev/null 2>&1 || true
+  svc_restart; sleep 2
+  new=$(sw_version)
+  if [[ $(svc_active) != active ]]; then die "strongSwan is not running after the update! See: vpn logs"; fi
+  run_swanctl --load-all >/dev/null 2>&1 || true
+  if run_swanctl --list-conns 2>/dev/null | grep -q '^rw:'; then
+    ok "strongSwan updated: $old -> $new (service healthy, connection 'rw' loaded)."
+  else
+    warn "strongSwan updated ($old -> $new) but connection 'rw' is not loaded. Run: vpn logs"
+  fi
+}
+
+# ------------------------------------------------------------ backup / restore
+# Backups contain private keys (CA, server, Let's Encrypt), every VPN password and the bot token.
+# Local copies are root-only (0600 in a 0700 folder). For copies that leave the server the tool
+# encrypts to a certificate whose private key stays with YOU (vpn backup key init|set).
+backup_archive() { # OUTFILE
+  local out="$1" paths=() p
+  for p in "$ETC" "$SWAN" "$LE_DIR"; do [[ -e $p ]] && paths+=("${p#/}"); done
+  [[ ${#paths[@]} -gt 0 ]] || return 1
+  ( umask 077; tar -C / -czf "$out" "${paths[@]}" 2>/dev/null ) || { rm -f "$out"; return 1; }
+  chmod 600 "$out"
+}
+
+backup_encrypt() { # IN OUT
+  openssl cms -encrypt -binary -aes-256-cbc -outform DER -in "$1" -out "$2" -recip "$BACKUP_PUB" 2>/dev/null \
+    && chmod 600 "$2"
+}
+
+backup_decrypt() { # IN KEY OUT
+  openssl cms -decrypt -binary -inform DER -in "$1" -inkey "$2" -out "$3" 2>/dev/null && return 0
+  [[ -f $BACKUP_PUB ]] && openssl cms -decrypt -binary -inform DER -in "$1" -inkey "$2" -recip "$BACKUP_PUB" -out "$3" 2>/dev/null
+}
+
+backup_prune() { # PATTERN KEEP
+  ls -1t $1 2>/dev/null | tail -n +"$(( $2 + 1 ))" | xargs -r rm -f
+}
+
+cmd_backup() {
+  need_root
+  case "${1:-}" in
+    key)     shift; locked _backup_key "$@" ;;
+    decrypt) shift; _backup_decrypt "$@" ;;
+    *)       locked _backup "$@" ;;
+  esac
+}
+
+_backup() {
+  local enc=0 a out stamp
+  for a in "$@"; do
+    case "$a" in --encrypt) enc=1 ;; *) die "Usage: vpn backup [--encrypt]   |   vpn backup key init|set FILE|show|remove   |   vpn backup decrypt FILE.enc KEY.pem [OUT]" ;; esac
+  done
+  if [[ $enc == 1 && ! -f $BACKUP_PUB ]]; then die "No backup encryption key yet. Create one first: vpn backup key init"; fi
+  mkdir -p "$BACKUPS"; chmod 700 "$BACKUPS"
+  stamp=$(date +%Y%m%d-%H%M%S)
+  out="$BACKUPS/ikev2-backup-$stamp.tar.gz"
+  backup_archive "$out" || die "Backup failed"
+  if [[ $enc == 1 ]]; then
+    backup_encrypt "$out" "$out.enc" || { rm -f "$out.enc"; die "Encrypting the backup failed (is $BACKUP_PUB a valid certificate?)"; }
+  fi
+  backup_prune "$BACKUPS/ikev2-backup-*.tar.gz" 10
+  backup_prune "$BACKUPS/ikev2-backup-*.tar.gz.enc" 10
+  ok "Backup created: $out"
+  if [[ $enc == 1 ]]; then ok "Encrypted copy: $out.enc   (the only kind that should ever leave this server)"; fi
+  return 0
+}
+
+_backup_key() {
+  local sub="${1:-show}" t f bits n
+  shift || true
+  case "$sub" in
+    init)
+      if [[ -f $BACKUP_PUB && ${1:-} != --force ]]; then
+        die "A backup key already exists (see: vpn backup key show). Use --force to replace it - older .enc backups then need the OLD private key."
+      fi
+      t=$(mktemp -d) || die "mktemp failed"; chmod 700 "$t"
+      if ! ( umask 077
+             openssl genrsa -out "$t/key.pem" "${IKEV2_BACKUP_KEY_BITS:-4096}" >/dev/null 2>&1 &&
+             openssl req -x509 -new -key "$t/key.pem" -subj "/CN=ikev2-manager backup" -days 36500 -out "$t/cert.pem" >/dev/null 2>&1 ); then
+        rm -rf "$t"; die "Could not generate the key pair (openssl)."
+      fi
+      mkdir -p "$ETC"; install -m 644 "$t/cert.pem" "$BACKUP_PUB"
+      say "============ BACKUP PRIVATE KEY - copy it NOW to a safe place (password manager / offline) ============"
+      say "It is NOT stored on this server. Without it, encrypted (.enc) backups can never be opened."
+      cat "$t/key.pem"
+      say "============ END OF PRIVATE KEY ============"
+      command -v shred >/dev/null 2>&1 && shred -u "$t/key.pem" 2>/dev/null
+      rm -rf "$t"
+      ok "Backup encryption is now on: vpn backup --encrypt  (the Telegram bot only sends encrypted backups)." ;;
+    set)
+      f="${1:-}"; [[ -f $f ]] || die "Usage: vpn backup key set CERT.pem   (an X.509 certificate with an RSA key >= 2048 bit; keep its private key yourself)"
+      openssl x509 -in "$f" -noout 2>/dev/null || die "That file is not a PEM certificate. Create one on YOUR computer:
+  openssl req -x509 -newkey rsa:4096 -nodes -keyout backup.key -out backup.crt -days 36500 -subj /CN=ikev2-backup"
+      bits=$(openssl x509 -in "$f" -noout -text 2>/dev/null | sed -n 's/.*Public-Key: (\([0-9]*\) bit).*/\1/p' | head -1)
+      openssl x509 -in "$f" -noout -text 2>/dev/null | grep -q 'rsaEncryption' && [[ ${bits:-0} -ge 2048 ]] \
+        || die "Only RSA keys of at least 2048 bit are supported."
+      mkdir -p "$ETC"; install -m 644 "$f" "$BACKUP_PUB"
+      ok "Backup encryption certificate installed. Fingerprint: $(openssl x509 -in "$BACKUP_PUB" -noout -fingerprint -sha256 | cut -d= -f2)" ;;
+    show|status)
+      if [[ -f $BACKUP_PUB ]]; then
+        say "Backup encryption: ON"
+        say "Fingerprint: $(openssl x509 -in "$BACKUP_PUB" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)"
+      else
+        say "Backup encryption: OFF   (enable: vpn backup key init)"
+      fi ;;
+    remove)
+      rm -f "$BACKUP_PUB"; ok "Backup encryption key removed (existing .enc files stay readable with your private key)." ;;
+    *) die "Usage: vpn backup key init [--force] | set CERT.pem | show | remove" ;;
+  esac
+}
+
+_backup_decrypt() { # FILE.enc KEY.pem [OUT]
+  local in="${1:-}" key="${2:-}" out="${3:-}"
+  [[ -f $in && -f $key ]] || die "Usage: vpn backup decrypt FILE.enc PRIVATE_KEY.pem [OUT.tar.gz]"
+  [[ -n $out ]] || out="${in%.enc}"
+  [[ $out != "$in" ]] || die "Give an output file name."
+  ( umask 077; backup_decrypt "$in" "$key" "$out" ) || { rm -f "$out"; die "Could not decrypt (wrong key?)."; }
+  chmod 600 "$out"; ok "Decrypted to $out"
+}
+
+cmd_backups() { ls -1t "$BACKUPS"/ikev2-backup-*.tar.gz "$BACKUPS"/ikev2-backup-*.tar.gz.enc 2>/dev/null; }
+
+cmd_restore() { need_root; locked _restore "$@"; }
+_restore() {
+  local f="" key="" a want=0 tmp="" pre orig
+  for a in "$@"; do
+    if [[ $want == 1 ]]; then key="$a"; want=0; continue; fi
+    case "$a" in --key) want=1 ;; *) f="$a" ;; esac
+  done
+  [[ -f $f ]] || die "Usage: vpn restore FILE.tar.gz | FILE.enc --key PRIVATE_KEY.pem   (see: vpn backups)"
+  orig="$f"
+  if [[ $f == *.enc ]]; then
+    [[ -f $key ]] || die "This backup is encrypted: vpn restore FILE.enc --key PRIVATE_KEY.pem"
+    tmp=$(mktemp "${TMPDIR:-/tmp}/ikev2-restore.XXXXXX") || die "mktemp failed"
+    ( umask 077; backup_decrypt "$f" "$key" "$tmp" ) || { rm -f "$tmp"; die "Could not decrypt the backup (wrong key?). Nothing was changed."; }
+    f="$tmp"
+  fi
+  # never extract an unchecked archive as root: every entry must stay inside the tool's own folders
+  if ! python3 "$OPT/ikev2lib.py" check-backup "$f" "${ETC#/}" "${SWAN#/}" "${LE_DIR#/}"; then
+    [[ -n $tmp ]] && rm -f "$tmp"
+    die "This archive was rejected (reasons above): it is not a plain ikev2-manager backup. Nothing was restored."
+  fi
+  step "Saving the current state first"
+  mkdir -p "$BACKUPS"; chmod 700 "$BACKUPS"
+  pre="$BACKUPS/ikev2-prerestore-$(date +%Y%m%d-%H%M%S).tar.gz"
+  if backup_archive "$pre"; then say "  (undo copy: $pre)"; else warn "could not create the safety copy"; fi
+  backup_prune "$BACKUPS/ikev2-prerestore-*.tar.gz" 3
+  step "Restoring $orig"
+  if ! tar -C / -xzf "$f"; then [[ -n $tmp ]] && rm -f "$tmp"; die "Restore failed - the previous state is in $pre"; fi
+  [[ -n $tmp ]] && rm -f "$tmp"
+  cfg_load
+  rebuild_conf || warn "Could not regenerate swanctl.conf from the restored data - check: vpn logs"
+  run_swanctl --load-creds >/dev/null 2>&1 || true
+  svc_restart
+  _net_apply
+  ok "Restore finished. Services restarted."
+}
+
+# ------------------------------------------------------------ systemd units
+install_units() {
+  # in test mode units are only written when a scratch IKEV2_UNIT_DIR was given (never to the real /etc)
+  [[ $TESTMODE == 1 && -z ${IKEV2_UNIT_DIR:-} ]] && return 0
+  mkdir -p "$UNIT_DIR"
+  cat >"$UNIT_DIR/ikev2-net.service" <<EOF
+[Unit]
+Description=IKEv2 Manager network rules (NAT, forwarding, firewall)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$SELF net apply
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat >"$UNIT_DIR/ikev2-bot.service" <<EOF
+[Unit]
+Description=IKEv2 Manager Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 $OPT/bot.py
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=2
+# The bot talks to Telegram and calls 'vpn' (as root). It needs root, but nothing else:
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat >"$UNIT_DIR/ikev2-certcheck.service" <<EOF
+[Unit]
+Description=IKEv2 Manager certificate check
+
+[Service]
+Type=oneshot
+ExecStart=$SELF cert auto
+EOF
+  cat >"$UNIT_DIR/ikev2-certcheck.timer" <<EOF
+[Unit]
+Description=Daily IKEv2 certificate check
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  [[ $TESTMODE == 1 ]] || systemctl daemon-reload
+}
+
+# ------------------------------------------------------------ telegram bot management
+TOKEN_RE='^[0-9]{5,15}:[A-Za-z0-9_-]{20,100}$'
+
+# The token is handed to curl through a config on stdin, so it never shows up in `ps` / /proc/*/cmdline.
+tg_api() { # method [curl args...]
+  local m="$1"; shift
+  [[ $BOT_TOKEN =~ $TOKEN_RE ]] || return 1
+  printf 'url = "https://api.telegram.org/bot%s/%s"\n' "$BOT_TOKEN" "$m" | curl -s --max-time 15 -K - "$@"
+}
+
+bot_validate_token() { # token -> prints bot username
+  local r
+  [[ $1 =~ $TOKEN_RE ]] || return 1
+  r=$(printf 'url = "https://api.telegram.org/bot%s/getMe"\n' "$1" | curl -s --max-time 15 -K -) || return 1
+  grep -q '"ok":true' <<<"$r" || return 1
+  grep -oE '"username":"[^"]+"' <<<"$r" | head -1 | cut -d'"' -f4
+}
+
+cmd_bot() { need_root; locked _bot "$@"; }
+_bot() {
+  cfg_load
+  case "${1:-status}" in
+    setup)
+      local tok="${2:-}" aid="${3:-}" uname
+      [[ $tok == - ]] && { IFS= read -r tok || true; }
+      [[ -n $tok && -n $aid ]] || die "Usage: vpn bot setup TOKEN|- ADMIN_ID   ('-' reads the token from stdin: keeps it out of the process list and shell history)"
+      [[ $aid =~ ^[0-9]+$ ]] || die "ADMIN_ID must be a numeric Telegram user id."
+      [[ $tok =~ $TOKEN_RE ]] || die "That does not look like a Telegram bot token (expected 123456789:AAxxxxxxxx...)."
+      uname=$(bot_validate_token "$tok") || die "Telegram rejected this token (or no internet)."
+      cfg_set BOT_TOKEN "$tok"; cfg_set ADMIN_ID "$aid"
+      install_units
+      systemctl enable --now ikev2-bot >/dev/null 2>&1 || die "Could not start ikev2-bot"
+      systemctl restart ikev2-bot
+      ok "Bot @$uname is running. Open Telegram, send /start to it from account $aid." ;;
+    on)  [[ -n $BOT_TOKEN ]] || die "Run: vpn bot setup TOKEN ADMIN_ID"; systemctl enable --now ikev2-bot; ok "Bot enabled." ;;
+    off) systemctl disable --now ikev2-bot 2>/dev/null; ok "Bot disabled." ;;
+    status)
+      say "Configured: $([[ -n $BOT_TOKEN ]] && echo yes || echo no)   Admin id: ${ADMIN_ID:-none}"
+      say "Service:    $(systemctl is-active ikev2-bot 2>/dev/null || echo inactive)" ;;
+    test)
+      [[ -n $BOT_TOKEN && -n $ADMIN_ID ]] || die "Bot is not configured."
+      tg_api sendMessage -d "chat_id=$ADMIN_ID" --data-urlencode "text=✅ Test message from $(hostname) (vpn v$VERSION)" | grep -q '"ok":true' \
+        && ok "Test message sent." || die "Sending failed (check token / start the bot chat first)." ;;
+    logs) journalctl -u ikev2-bot -n "${2:-60}" --no-pager ;;
+    *) die "Usage: vpn bot setup|on|off|status|test|logs" ;;
+  esac
+}
+
+# ------------------------------------------------------------ status
+cmd_online() { python3 "$OPT/ikev2lib.py" online; }
+
+cmd_status() {
+  cfg_load
+  local svc online users enabled days cstate cline bkey bot
+  svc=$(svc_active); users=$(user_count); enabled=$(user_enabled_count)
+  online=$(python3 "$OPT/ikev2lib.py" count 2>/dev/null || echo 0)
+  days=$(cert_days_left); cstate=$(cert_state)
+  [[ -f $BACKUP_PUB ]] && bkey=yes || bkey=no
+  case "$cstate" in
+    missing) cline="MISSING - run: vpn cert renew" ;;
+    expired) cline="EXPIRED $(( -days )) day(s) ago - run: vpn cert renew" ;;
+    *)       cline="$days days left" ;;
+  esac
+  bot=$(systemctl is-active ikev2-bot 2>/dev/null || echo inactive)
+  if [[ ${1:-} == --kv ]]; then
+    cat <<EOF
+version=$VERSION
+service=$svc
+sw_version=$(sw_version)
+mode=$MODE
+server=$SERVER_NAME
+users=$users
+enabled=$enabled
+online=$online
+cert_days=$days
+cert_state=$cstate
+backup_key=$bkey
+firewall=$FIREWALL
+bot=$bot
+pool=$POOL
+dns=$DNS
+EOF
+    return
+  fi
+  say "IKEv2 Manager v$VERSION"
+  say "Service:       $svc"
+  say "strongSwan:    $(sw_version)"
+  say "Mode:          $MODE"
+  say "Server:        $SERVER_NAME"
+  say "Users:         $users ($enabled enabled), online now: $online"
+  say "Certificate:   $cline"
+  say "Backup key:    $bkey"
+  say "Firewall:      $FIREWALL"
+  say "Telegram bot:  $bot"
+}
+
+cmd_logs() {
+  local n="${1:-80}"
+  [[ $n =~ ^[1-9][0-9]{0,3}$ ]] || die "Usage: vpn logs [LINES]   (1-9999)"
+  journalctl -u "$(svc_name)" -n "$n" --no-pager 2>/dev/null
+}
+cmd_restart() { need_root; svc_restart; sleep 1; run_swanctl --load-all >/dev/null 2>&1; ok "Service: $(svc_active)"; }
+
+# ------------------------------------------------------------ advanced settings
+CHARON_D="${IKEV2_STRONGSWAND:-/etc/strongswan.d}"
+
+SETTING_KEYS=(DNS POOL LOCAL_TS IKE_PROPOSALS ESP_PROPOSALS DPD_DELAY FRAGMENTATION MOBIKE UNIQUE
+  REKEY_TIME REAUTH_TIME CHILD_REKEY_TIME CHILD_LIFE_TIME SEND_CERT MSS_CLAMP NAT
+  FW_EXTRA_TCP FW_EXTRA_UDP LOG_LEVEL CLIENT_ISOLATION BLOCK_PRIVATE IKE_RATE_LIMIT IPV6_BLOCK)
+
+declare -A S_DESC=(
+  [DNS]='DNS servers pushed to clients'
+  [POOL]='Virtual IP range handed to clients'
+  [LOCAL_TS]='Routes pushed to clients (0.0.0.0/0 = all traffic, else split tunnel)'
+  [IKE_PROPOSALS]='IKE (phase 1) proposals the server accepts'
+  [ESP_PROPOSALS]='ESP (phase 2) proposals the server accepts'
+  [DPD_DELAY]='Dead peer detection interval'
+  [FRAGMENTATION]='IKE fragmentation (helps when UDP packets get dropped)'
+  [MOBIKE]='MOBIKE: keep the VPN alive when the client changes network (wifi/4G)'
+  [UNIQUE]='What to do when a user connects twice (devices per account)'
+  [REKEY_TIME]='IKE SA rekey time (empty = strongSwan default)'
+  [REAUTH_TIME]='Force full re-authentication after this time (empty = never)'
+  [CHILD_REKEY_TIME]='Child SA (ESP) rekey time (empty = strongSwan default)'
+  [CHILD_LIFE_TIME]='Child SA (ESP) lifetime (empty = strongSwan default)'
+  [SEND_CERT]='When the server sends its certificate'
+  [MSS_CLAMP]='TCP MSS clamping for tunnel traffic (fixes slow/stuck pages)'
+  [NAT]='NAT (masquerade) VPN traffic out of the server'
+  [FW_EXTRA_TCP]='Extra TCP ports to allow inbound when the firewall is on'
+  [FW_EXTRA_UDP]='Extra UDP ports to allow inbound when the firewall is on'
+  [LOG_LEVEL]='strongSwan log verbosity (journal)'
+  [CLIENT_ISOLATION]='Stop VPN clients from reaching each other (device-to-device)'
+  [BLOCK_PRIVATE]='Stop VPN clients from reaching private networks (RFC1918/CGNAT) behind the server'
+  [IKE_RATE_LIMIT]='Max new IKE handshakes per minute per source IP on UDP/500 (brute-force brake)'
+  [IPV6_BLOCK]='Route ::/0 into the tunnel and drop it, so IPv6 cannot leak (experimental)'
+)
+declare -A S_DEF=(
+  [DNS]="$D_DNS" [POOL]="$D_POOL" [LOCAL_TS]="$D_LOCAL_TS" [IKE_PROPOSALS]="$D_IKE_PROPOSALS"
+  [ESP_PROPOSALS]="$D_ESP_PROPOSALS" [DPD_DELAY]="$D_DPD_DELAY" [FRAGMENTATION]="$D_FRAGMENTATION"
+  [MOBIKE]="$D_MOBIKE" [UNIQUE]="$D_UNIQUE" [REKEY_TIME]="" [REAUTH_TIME]="" [CHILD_REKEY_TIME]=""
+  [CHILD_LIFE_TIME]="" [SEND_CERT]="$D_SEND_CERT" [MSS_CLAMP]="$D_MSS_CLAMP" [NAT]="$D_NAT"
+  [FW_EXTRA_TCP]="" [FW_EXTRA_UDP]="" [LOG_LEVEL]="$D_LOG_LEVEL"
+  [CLIENT_ISOLATION]="$D_CLIENT_ISOLATION" [BLOCK_PRIVATE]="$D_BLOCK_PRIVATE"
+  [IKE_RATE_LIMIT]="$D_IKE_RATE_LIMIT" [IPV6_BLOCK]="$D_IPV6_BLOCK"
+)
+declare -A S_HINT=(
+  [DNS]='comma-separated IPv4, e.g. 1.1.1.1,8.8.8.8'
+  [POOL]='IPv4 CIDR /8../30, e.g. 10.30.0.0/16'
+  [LOCAL_TS]='comma-separated CIDRs, e.g. 0.0.0.0/0 or 10.0.0.0/8,192.168.1.0/24'
+  [IKE_PROPOSALS]='strongSwan proposal list, e.g. default,aes256-sha256-modp2048'
+  [ESP_PROPOSALS]='strongSwan proposal list, e.g. default,aes256gcm16'
+  [DPD_DELAY]='number + s/m/h/d, e.g. 30s'
+  [FRAGMENTATION]='yes | no | force | accept'
+  [MOBIKE]='yes | no'
+  [UNIQUE]='no | never | keep | replace  (no = allow several sessions per user)'
+  [REKEY_TIME]='e.g. 4h, 1h, 24h'
+  [REAUTH_TIME]='e.g. 24h'
+  [CHILD_REKEY_TIME]='e.g. 1h'
+  [CHILD_LIFE_TIME]='e.g. 1h20m is NOT allowed; use one unit, e.g. 80m'
+  [SEND_CERT]='always | ifasked | never'
+  [MSS_CLAMP]='pmtu | off | a number 536-1460 (e.g. 1360)'
+  [NAT]='yes | no'
+  [FW_EXTRA_TCP]='ports, comma or space separated, e.g. 443,8080'
+  [FW_EXTRA_UDP]='ports, comma or space separated'
+  [LOG_LEVEL]='default | -1 | 0 | 1 | 2 | 3 | 4  (higher = more detail)'
+  [CLIENT_ISOLATION]='yes | no   (yes = clients cannot talk to each other)'
+  [BLOCK_PRIVATE]='yes | no   (LOCAL_TS routes and the DNS servers stay reachable)'
+  [IKE_RATE_LIMIT]='off | a number 10-100000 (new IKE_SA_INIT per minute per IP, e.g. 60)'
+  [IPV6_BLOCK]='yes | no   (only has an effect when LOCAL_TS contains 0.0.0.0/0)'
+)
+declare -A S_CHECK=(
+  [DNS]=v_dns [POOL]=v_pool [LOCAL_TS]=v_cidr_list [IKE_PROPOSALS]=v_props [ESP_PROPOSALS]=v_props
+  [DPD_DELAY]=v_dur1 [FRAGMENTATION]='enum:yes|no|force|accept' [MOBIKE]='enum:yes|no'
+  [UNIQUE]='enum:no|never|keep|replace' [REKEY_TIME]=v_dur1 [REAUTH_TIME]=v_dur1
+  [CHILD_REKEY_TIME]=v_dur1 [CHILD_LIFE_TIME]=v_dur1 [SEND_CERT]='enum:always|ifasked|never'
+  [MSS_CLAMP]=v_mss [NAT]='enum:yes|no' [FW_EXTRA_TCP]=v_ports [FW_EXTRA_UDP]=v_ports
+  [LOG_LEVEL]='enum:default|-1|0|1|2|3|4'
+  [CLIENT_ISOLATION]='enum:yes|no' [BLOCK_PRIVATE]='enum:yes|no' [IKE_RATE_LIMIT]=v_ratelimit [IPV6_BLOCK]='enum:yes|no'
+)
+
+v_ipv4() {
+  local ip="$1" o
+  [[ $ip =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1}"; do (( 10#$o <= 255 )) || return 1; done
+}
+v_cidr() {
+  local ip="${1%/*}" p="${1#*/}"
+  [[ $1 == */* && $p =~ ^[0-9]{1,2}$ ]] || return 1
+  v_ipv4 "$ip" && (( 10#$p <= 32 ))
+}
+v_dns() { local x a; IFS=, read -ra a <<<"$1"; [[ ${#a[@]} -ge 1 ]] || return 1; for x in "${a[@]}"; do v_ipv4 "$x" || return 1; done; }
+v_pool() { v_cidr "$1" && (( 10#${1#*/} >= 8 && 10#${1#*/} <= 30 )); }
+v_cidr_list() { local x a; IFS=, read -ra a <<<"$1"; [[ ${#a[@]} -ge 1 ]] || return 1; for x in "${a[@]}"; do v_cidr "$x" || return 1; done; }
+v_props() { [[ $1 =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]]; }
+v_dur1() { [[ $1 =~ ^[0-9]+[smhd]?$ ]]; }
+v_ports() { local p; for p in ${1//,/ }; do [[ $p =~ ^[0-9]+$ ]] && (( 10#$p >= 1 && 10#$p <= 65535 )) || return 1; done; }
+v_ratelimit() { [[ $1 == off ]] || { [[ $1 =~ ^[0-9]{2,6}$ ]] && (( 10#$1 >= 10 && 10#$1 <= 100000 )); }; }
+v_mss() { [[ $1 =~ ^(pmtu|off)$ ]] || { [[ $1 =~ ^[0-9]{3,4}$ ]] && (( 10#$1 >= 536 && 10#$1 <= 1460 )); }; }
+
+setting_valid() { # key value   (control characters / line breaks are never valid - read() only sees the first line)
+  local chk="${S_CHECK[$1]}"
+  [[ $2 != *[[:cntrl:]]* ]] || return 1
+  case "$chk" in
+    enum:*) [[ $2 =~ ^(${chk#enum:})$ ]] ;;
+    *)      "$chk" "$2" ;;
+  esac
+}
+
+setting_known() { [[ -n ${S_DESC[$1]+x} ]]; }
+
+# ---- apply: regenerate everything from config (+ roll back on failure)
+settings_apply() {
+  local f="$CHARON_D/ikev2-manager.conf" changed=0 new
+  mkdir -p "$CHARON_D" "$ETC/custom"
+  cfg_load
+  new=$(mktemp)
+  {
+    echo "# Generated by ikev2-manager - use: vpn set LOG_LEVEL ... / vpn raw edit charon"
+    if [[ $LOG_LEVEL != default ]]; then
+      printf 'charon-systemd {\n  journal {\n    default = %s\n  }\n}\n' "$LOG_LEVEL"
+    fi
+    if [[ -s $ETC/custom/charon.conf ]]; then cat "$ETC/custom/charon.conf"; fi
+  } >"$new"
+  if ! cmp -s "$new" "$f" 2>/dev/null; then
+    if [[ -f $f ]]; then cp -f "$f" "$f.bak"; else rm -f "$f.bak"; fi
+    install -m 644 "$new" "$f"; changed=1
+  fi
+  rm -f "$new"
+  rebuild_conf || return 1
+  [[ $TESTMODE == 1 ]] && return 0
+  net_apply
+  if [[ $changed == 1 ]]; then
+    svc_restart; sleep 2
+    if [[ $(svc_active) != active ]]; then
+      err "strongSwan did not start with the new daemon settings; reverting."
+      if [[ -f $f.bak ]]; then cp -f "$f.bak" "$f"; else rm -f "$f"; fi
+      svc_restart; return 1
+    fi
+  fi
+  return 0
+}
+
+# ---- commands
+cmd_get() {
+  cfg_load
+  local k v def
+  if [[ -n ${1:-} ]]; then
+    k="${1^^}"; setting_known "$k" || die "Unknown setting '$k'. See: vpn get"
+    v="${!k}"; def="${S_DEF[$k]}"
+    say "$k = ${v:-(default)}"
+    say "  ${S_DESC[$k]}"; say "  accepts: ${S_HINT[$k]}"; say "  default: ${def:-(strongSwan default)}"
+    return
+  fi
+  printf '%-18s %s\n' SETTING VALUE
+  for k in "${SETTING_KEYS[@]}"; do
+    v="${!k}"; def="${S_DEF[$k]}"
+    if [[ $v == "$def" ]]; then v="${v:-(default)}  [default]"; fi
+    printf '%-18s %s\n' "$k" "$v"
+  done
+}
+
+cmd_set() { need_root; locked _set "$@"; }
+_set() {
+  local k="${1:-}" v="${2-}" oldraw newraw
+  k="${k^^}"
+  [[ -n $k ]] || die "Usage: vpn set KEY VALUE   (VALUE 'default' resets)  - see: vpn get"
+  setting_known "$k" || die "Unknown setting '$k'. See: vpn get"
+  cfg_load
+  oldraw=$(cfg_raw "$k")
+  if [[ -z $v || $v == default ]]; then
+    newraw=""
+  else
+    setting_valid "$k" "$v" || die "Invalid value for $k. Accepts: ${S_HINT[$k]}"
+    newraw="$v"
+  fi
+  cfg_set "$k" "$newraw" || die "Could not save the setting."
+  if settings_apply; then
+    ok "$k = ${newraw:-default}"
+    log "set $k=${newraw:-default}"
+    case "$k" in POOL|DNS|LOCAL_TS|IPV6_BLOCK) say "Clients must reconnect to pick this up." ;; esac
+  else
+    cfg_set "$k" "$oldraw"; settings_apply >/dev/null 2>&1
+    die "The server rejected '$v' for $k - the previous value was restored."
+  fi
+  return 0
+}
+
+cmd_reset() {
+  need_root
+  local yes=0 a ans
+  for a in "$@"; do case "$a" in --yes|-y) yes=1 ;; esac; done
+  if [[ $yes != 1 ]]; then
+    [[ -t 0 ]] || die "This resets ALL advanced settings to their defaults. Re-run with --yes to confirm."
+    read -rp "Reset all advanced settings to defaults? [y/N] " ans
+    [[ $ans =~ ^[Yy]$ ]] || { say "Cancelled."; return 1; }
+  fi
+  locked _reset
+}
+_reset() {
+  local k
+  for k in "${SETTING_KEYS[@]}"; do cfg_set "$k" "" || return 1; done
+  settings_apply && ok "All advanced settings reset to defaults (raw snippets untouched)."
+}
+
+DNS_PRESETS="cloudflare google quad9 adguard cloudflare-family opendns"
+dns_preset_value() {
+  case "$1" in
+    cloudflare)        echo "1.1.1.1,1.0.0.1" ;;
+    google)            echo "8.8.8.8,8.8.4.4" ;;
+    quad9)             echo "9.9.9.9,149.112.112.112" ;;
+    adguard)           echo "94.140.14.14,94.140.15.15" ;;
+    cloudflare-family) echo "1.1.1.3,1.0.0.3" ;;
+    opendns)           echo "208.67.222.222,208.67.220.220" ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd_preset() {
+  local kind="${1:-}" name="${2:-}" v
+  case "$kind" in
+    dns)
+      if [[ $name == list || -z $name ]]; then
+        for v in $DNS_PRESETS; do printf '  %-18s %s\n' "$v" "$(dns_preset_value "$v")"; done; return
+      fi
+      v=$(dns_preset_value "$name") || die "Unknown DNS preset. Options: $DNS_PRESETS"
+      cmd_set DNS "$v" ;;
+    ike)
+      case "$name" in
+        compat)      cmd_set IKE_PROPOSALS default ;;
+        strict-sha2) cmd_set IKE_PROPOSALS 'aes256-sha256-modp2048,aes128-sha256-modp2048,aes256-sha256-ecp256,aes256-sha384-ecp384' ;;
+        *) die "Usage: vpn preset ike compat|strict-sha2   (strict-sha2 = explicit SHA-2-only list: no SHA-1 and no built-in 'default' list; old clients may fail)" ;;
+      esac ;;
+    *) die "Usage: vpn preset dns NAME|list   |   vpn preset ike compat|strict-sha2" ;;
+  esac
+}
+
+# ---- raw snippets: any strongSwan option can be added through these
+RAW_NAMES=(connection local remote child pools extra charon)
+declare -A RAW_HELP=(
+  [connection]='lines inside  connections { rw { ... } }   (e.g. reauth_time, inactivity ...)'
+  [local]='lines inside the server  local { ... }  block'
+  [remote]='lines inside the client  remote { ... }  block'
+  [child]='lines inside  children { net { ... } }   (e.g. mode, dpd_action ...)'
+  [pools]='lines inside  pools { rw_pool { ... } }   (e.g. wins, nbns, dhcp ...)'
+  [extra]='whole extra sections appended to swanctl.conf (more connections, authorities, secrets ...)'
+  [charon]='raw strongswan.conf fragment for the daemon (e.g. charon { dos_protection = yes })'
+)
+
+_raw_apply() { # FILE NAME SUB
+  if settings_apply; then
+    ok "Applied: $2"; log "raw $3 $2"
+  else
+    cp -f "$1.prev" "$1"; settings_apply >/dev/null 2>&1
+    die "The server rejected this snippet - the previous content was restored."
+  fi
+}
+
+cmd_raw() {
+  local sub="${1:-list}" name="${2:-}" f n ed
+  if [[ $sub != list ]]; then
+    [[ " ${RAW_NAMES[*]} " == *" $name "* ]] || die "Usage: vpn raw list | show|edit|set|clear NAME   (NAME: ${RAW_NAMES[*]})"
+    f="$ETC/custom/$name.conf"
+  fi
+  case "$sub" in
+    list)
+      for n in "${RAW_NAMES[@]}"; do
+        printf '  %-11s %-8s %s\n' "$n" "$([[ -s $ETC/custom/$n.conf ]] && echo "$(wc -l <"$ETC/custom/$n.conf") lines" || echo empty)" "${RAW_HELP[$n]}"
+      done ;;
+    show) [[ -s $f ]] && cat "$f" || say "(empty)" ;;
+    edit|set|clear)
+      need_root
+      mkdir -p "$ETC/custom"
+      if [[ -f $f ]]; then cp -f "$f" "$f.prev"; else : >"$f.prev"; fi
+      case "$sub" in
+        edit)
+          [[ -t 0 && -t 1 ]] || die "'edit' needs a terminal. Use: vpn raw set $name < file"
+          ed="${EDITOR:-}"; [[ -n $ed ]] || ed=$(command -v nano || command -v vi || true)
+          [[ -n $ed ]] || die "No editor found (install nano or set EDITOR)."
+          [[ -f $f ]] || : >"$f"
+          "$ed" "$f" ;;
+        set)   cat >"$f" ;;
+        clear) : >"$f" ;;
+      esac
+      locked _raw_apply "$f" "$name" "$sub" ;;
+    *) die "Usage: vpn raw list | show|edit|set|clear NAME" ;;
+  esac
+}
+
+cmd_conf() {
+  case "${1:-show}" in
+    show)
+      sed -E 's/(secret = ").*(")/\1********\2/' "$SWAN/swanctl.conf"
+      if [[ -s $CHARON_D/ikev2-manager.conf ]]; then
+        echo; echo "# --- $CHARON_D/ikev2-manager.conf"; cat "$CHARON_D/ikev2-manager.conf"
+      fi ;;
+    apply) need_root; locked settings_apply && ok "Configuration regenerated and applied." ;;
+    *) die "Usage: vpn conf show|apply" ;;
+  esac
+}
+
+# ---- advanced settings menus
+tui_presets() {
+  local i=1 n ans v
+  while true; do
+    ui_header "Presets"
+    echo; echo " DNS providers:"
+    i=1
+    for n in $DNS_PRESETS; do ui_item "$i" "$(printf '%-18s %s' "$n" "$(dns_preset_value "$n")")"; i=$((i+1)); done
+    echo; echo " IKE strictness:"
+    ui_item a "compat       (default; accepts SHA-1 fallbacks)"
+    ui_item b "strict-sha2  (SHA-2 only)"
+    ui_item 0 "Back"
+    ui_choose
+    case $CHOICE in
+      0|"") return ;;
+      a) ui_show "$( (cmd_preset ike compat) 2>&1 )" ;;
+      b) ui_show "$( (cmd_preset ike strict-sha2) 2>&1 )" ;;
+      *) if [[ $CHOICE =~ ^[0-9]+$ ]]; then
+           n=$(echo $DNS_PRESETS | tr ' ' '\n' | sed -n "${CHOICE}p")
+           [[ -n $n ]] && ui_show "$( (cmd_preset dns "$n") 2>&1 )"
+         fi ;;
+    esac
+  done
+}
+
+tui_raw() {
+  local i n
+  while true; do
+    ui_header "Raw config snippets"
+    echo; echo " Add ANY strongSwan option here. It is validated by loading it;"
+    echo " if the server rejects it, the previous content is restored."; echo
+    i=1
+    for n in "${RAW_NAMES[@]}"; do
+      ui_item "$i" "$(printf '%-11s %s' "$n" "$([[ -s $ETC/custom/$n.conf ]] && echo '(has content)' || echo '(empty)')")"
+      echo "        $(c 2)${RAW_HELP[$n]}$(c 0)"
+      i=$((i+1))
+    done
+    ui_item 0 "Back"
+    ui_choose
+    case $CHOICE in
+      0|"") return ;;
+      *) if [[ $CHOICE =~ ^[0-9]+$ && $CHOICE -ge 1 && $CHOICE -le ${#RAW_NAMES[@]} ]]; then
+           n="${RAW_NAMES[$((CHOICE-1))]}"
+           ui_run cmd_raw edit "$n"
+         fi ;;
+    esac
+  done
+}
+
+tui_advanced() {
+  local i k v out
+  while true; do
+    cfg_load
+    ui_header "Advanced strongSwan settings"
+    echo; i=1
+    for k in "${SETTING_KEYS[@]}"; do
+      v="${!k}"; [[ -n $v ]] || v="(default)"
+      printf '  %s%2d)%s %-17s %s\n' "$(c '1;33')" "$i" "$(c 0)" "$k" "${v:0:32}"
+      i=$((i+1))
+    done
+    echo
+    ui_item p "Presets (DNS providers, IKE strictness)"
+    ui_item r "Raw snippets - edit ANY strongSwan option"
+    ui_item v "View generated swanctl.conf"
+    ui_item x "Reset all settings to defaults"
+    ui_item 0 "Back"
+    ui_choose
+    case $CHOICE in
+      0|"") return ;;
+      p) tui_presets ;;
+      r) tui_raw ;;
+      v) ui_show "$( (cmd_conf show) 2>&1 )" ;;
+      x) echo; if ui_yesno "Reset all advanced settings to defaults?" n; then ui_run cmd_reset --yes; fi ;;
+      *) if [[ $CHOICE =~ ^[0-9]+$ && $CHOICE -ge 1 && $CHOICE -le ${#SETTING_KEYS[@]} ]]; then
+           k="${SETTING_KEYS[$((CHOICE-1))]}"
+           echo
+           echo " $k - ${S_DESC[$k]}"
+           echo " Accepts : ${S_HINT[$k]}"
+           echo " Default : ${S_DEF[$k]:-(strongSwan default)}"
+           echo " Current : ${!k:-(default)}"
+           v=$(ui_ask "New value (Enter = keep, 'default' = reset)"); echo
+           if [[ -n $v ]]; then out=$( cmd_set "$k" "$v" 2>&1 ); ui_show "$out"; fi
+         fi ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------ setup (used by the installer)
+cmd_setup() { need_root; locked _setup "$@"; }
+_setup() {
+  local mode=ip domain="" email="" user="user1" pass="" fw=no f2b=no au=no tok="" aid="" ip="" ub=""
+  # secrets handed over by install.sh travel in the environment (not visible in `ps`), never in argv
+  pass="${IKEV2_SETUP_PASS:-}"; tok="${IKEV2_SETUP_BOT_TOKEN:-}"; unset IKEV2_SETUP_PASS IKEV2_SETUP_BOT_TOKEN
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --mode)       mode="$2"; shift 2 ;;
+      --domain)     domain="$2"; mode=domain; shift 2 ;;
+      --email)      email="$2"; shift 2 ;;
+      --user)       user="$2"; shift 2 ;;
+      --pass)       pass="$2"; shift 2 ;;
+      --ip)         ip="$2"; shift 2 ;;
+      --firewall)   fw="$2"; shift 2 ;;
+      --fail2ban)   f2b="$2"; shift 2 ;;
+      --autoupdate) au="$2"; shift 2 ;;
+      --bot-token)  tok="$2"; shift 2 ;;
+      --admin-id)   aid="$2"; shift 2 ;;
+      --update-base) ub="$2"; shift 2 ;;
+      *) die "setup: unknown option $1" ;;
+    esac
+  done
+  [[ $mode == ip || $mode == domain ]] || die "setup: --mode must be ip or domain"
+  [[ $mode == domain && -z $domain ]] && die "Domain mode needs --domain"
+  [[ -z $domain || $domain =~ $DOMAIN_RE ]] || die "Invalid domain name: $domain"
+  [[ -z $email  || $email  =~ $EMAIL_RE  ]] || die "Invalid email address."
+  [[ -z $ip     ]] || v_ipv4 "$ip" || die "Invalid --ip (expected an IPv4 address)."
+  [[ $fw == yes || $fw == no ]] || die "setup: --firewall must be yes or no"
+  [[ $f2b == yes || $f2b == no ]] || die "setup: --fail2ban must be yes or no"
+  [[ $au == yes || $au == no ]] || die "setup: --autoupdate must be yes or no"
+  [[ $user =~ $NAME_RE ]] || die "Invalid username"
+  [[ -z $pass ]] || pass_check "$user" "$pass" || die "$PASS_ERR"
+  [[ -z $tok || $tok =~ $TOKEN_RE ]] || die "That does not look like a Telegram bot token."
+  [[ -z $aid || $aid =~ ^[0-9]+$ ]] || die "--admin-id must be numeric."
+  [[ -z $ub  ]] || update_base_ok "$ub" || die "--update-base must be an https:// (or file://) URL."
+  [[ -z $ub  ]] || cfg_set UPDATE_BASE "$ub"
+
+  mkdir -p "$ETC" "$VAR" "$BACKUPS"; chmod 700 "$ETC" "$BACKUPS"; : >>"$LOGFILE"
+
+  step "Installing packages (this can take a minute)"
+  export DEBIAN_FRONTEND=noninteractive
+  [[ $TESTMODE == 1 ]] || apt-get update >>"$LOGFILE" 2>&1 || warn "apt-get update reported errors (see $LOGFILE)"
+  apt_install strongswan strongswan-swanctl strongswan-pki charon-systemd \
+    libcharon-extra-plugins libcharon-extauth-plugins iptables curl openssl python3 ca-certificates
+  [[ $TESTMODE == 1 ]] || systemctl disable --now strongswan-starter >/dev/null 2>&1 || true
+
+  step "Detecting server address"
+  [[ -n $ip ]] || ip=$(detect_public_ip) || die "Could not detect the public IP. Re-run with --ip SERVER_IP"
+  cfg_set SERVER_IP "$ip"; cfg_set IFACE "$(default_iface)"
+  say "  Public IP: $ip   Interface: $(default_iface)"
+
+  # keep a copy of any pre-existing manual config, then clear it
+  if [[ -f $SWAN/swanctl.conf ]] && ! grep -q 'ikev2-manager' "$SWAN/swanctl.conf"; then
+    local old="$BACKUPS/pre-install-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$old"; cp -a "$SWAN" "$old/" 2>/dev/null || true
+    say "  Existing strongSwan config backed up to $old"
+    rm -f "$SWAN"/x509/* "$SWAN"/x509ca/* "$SWAN"/private/* "$SWAN/swanctl.conf" 2>/dev/null || true
+  fi
+
+  if [[ $mode == domain ]]; then mode_setup_domain "$domain" "$email"; else mode_setup_ip "$ip"; fi
+
+  step "Creating first user"
+  users_ensure
+  if user_exists "$user"; then pass=$(user_get "$user" 2); else
+    [[ -n $pass ]] || pass=$(gen_strong_pass "$user")
+    printf '%s:%s:enabled:%s\n' "$user" "$pass" "$(date +%s)" >>"$USERS"
+  fi
+
+  step "Configuring services"
+  install_units
+  if [[ $TESTMODE != 1 ]]; then
+    systemctl enable "$(svc_name)" >/dev/null 2>&1 || true
+    systemctl restart "$(svc_name)" || warn "Could not start $(svc_name)"
+    sleep 2
+  fi
+  rebuild_conf || die "Could not load VPN configuration (see: vpn logs)"
+  cfg_set FIREWALL "$fw"
+  if [[ $fw == yes ]]; then cfg_set FW_SSH_PORTS "$(fw_ssh_ports)"; fi
+  if [[ $TESTMODE != 1 ]]; then
+    systemctl enable ikev2-net >/dev/null 2>&1 || true
+    net_apply
+    systemctl enable --now ikev2-certcheck.timer >/dev/null 2>&1 || true
+  fi
+  [[ $f2b == yes ]] && sec_fail2ban
+  [[ $au == yes ]]  && sec_autoupdate
+  if [[ -n $tok && -n $aid ]]; then printf '%s\n' "$tok" | cmd_bot setup - "$aid" || warn "Bot setup failed; run 'vpn bot setup' later."; fi
+
+  local healthy="no"
+  if [[ $TESTMODE == 1 ]] || { [[ $(svc_active) == active ]] && run_swanctl --list-conns 2>/dev/null | grep -q '^rw:'; }; then healthy=yes; fi
+
+  say
+  ok "================ INSTALL COMPLETE ================"
+  say " Server address : $(grep "^SERVER_NAME=" "$CONF" | cut -d"'" -f2)"
+  say " Username       : $user"
+  say " Password       : $pass"
+  say " Health check   : $healthy"
+  say " Manage         : sudo vpn   (text menu)"
+  [[ $mode == ip ]] && say " Client trust   : use 'vpn profile $user' (CA is embedded in the profiles)"
+  say
+  warn "Open UDP 500 and UDP 4500 (and TCP 80 for domain mode) in your cloud firewall / Security Group."
+  [[ $healthy == yes ]] || warn "VPN did not pass the health check. Run: sudo vpn logs"
+}
+
+# ------------------------------------------------------------ migrate / selftest / update
+cmd_migrate() { locked _migrate; }
+_migrate() {
+  [[ -f $CONF ]] || return 0
+  cfg_load; users_ensure
+  mkdir -p "$VAR" "$BACKUPS"; chmod 700 "$BACKUPS" 2>/dev/null
+  install_units
+  [[ -n $SERVER_NAME ]] && rebuild_conf
+  [[ $TESTMODE == 1 ]] || _net_apply
+  return 0
+}
+
+cmd_selftest() {
+  local rc=0 cmd
+  bash -n "$SELF" 2>/dev/null || { err "vpn script has syntax errors"; rc=1; }
+  python3 -m py_compile "$OPT/bot.py" "$OPT/ikev2lib.py" 2>/dev/null || { err "python files do not compile"; rc=1; }
+  # run real commands and fail on shell runtime errors written to stderr
+  local out
+  for cmd in "version" "get" "status --kv" "user list"; do
+    out=$("$SELF" $cmd 2>&1 >/dev/null) || true
+    if grep -Eq 'command not found|unbound variable|syntax error|bad substitution' <<<"$out"; then
+      err "runtime error in 'vpn $cmd': $(head -1 <<<"$out")"; rc=1
+    fi
+  done
+  if [[ -f $CONF ]]; then
+    local bad
+    bad=$(grep -cvE "^[A-Z][A-Z0-9_]*='.*'$|^$" "$CONF")
+    [[ $bad -eq 0 ]] || { err "config.env has $bad unparsable line(s)"; rc=1; }
+    [[ $TESTMODE == 1 ]] || { [[ $(svc_active) == active ]] || { err "VPN service is not active"; rc=1; }; }
+  fi
+  return $rc
+}
+
+version_older() { # $1 older than $2 ?
+  [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1) == "$1" ]]
+}
+
+# --- release download + verification -------------------------------------------------------------
+# An update is downloaded into a private folder, verified (SHA256SUMS, and a signature when a
+# release key is pinned in /etc/ikev2/release.pub) and only THEN executed. Nothing that has not
+# been verified is ever run as root.
+REL_FILES=(install.sh vpn bot.py ikev2lib.py VERSION)
+VERSION_RE='^[0-9]+(\.[0-9]+)*([-.][A-Za-z0-9]+)*$'
+
+update_base_ok() { [[ $1 =~ ^(https://|file://)[A-Za-z0-9._~:/?#@%+=\&,-]+$ ]]; }
+
+curl_get() { # URL : https or file only; a redirect may never downgrade to http
+  case "$1" in
+    https://*) curl -fsSL --max-time 60 --proto '=https' --proto-redir '=https' "$1" ;;
+    file://*)  curl -fsSL --max-time 60 --proto '=file' "$1" ;;
+    *) err "refusing to fetch $1 (only https:// and file:// are allowed)"; return 1 ;;
+  esac
+}
+
+release_fetch() { # BASE DIR
+  local base="$1" d="$2" f
+  for f in "${REL_FILES[@]}" SHA256SUMS; do
+    curl_get "$base/$f" >"$d/$f" 2>/dev/null || { err "could not download $base/$f"; return 1; }
+  done
+  for f in release.pub SHA256SUMS.sig; do curl_get "$base/$f" >"$d/$f" 2>/dev/null || rm -f "$d/$f"; done
+  return 0
+}
+
+release_verify() { # DIR
+  local d="$1" f exp got key=""
+  [[ -s $d/SHA256SUMS ]] || { err "SHA256SUMS is missing"; return 1; }
+  for f in "${REL_FILES[@]}" $([[ -f $d/release.pub ]] && echo release.pub); do
+    exp=$(awk -v f="$f" '{n=$2; sub(/^\*/,"",n)} n==f{print $1; exit}' "$d/SHA256SUMS")
+    [[ $exp =~ ^[0-9a-f]{64}$ ]] || { err "$f is not listed in SHA256SUMS"; return 1; }
+    got=$(sha256sum "$d/$f" 2>/dev/null | cut -d' ' -f1)
+    [[ $got == "$exp" ]] || { err "checksum mismatch for $f - corrupted or tampered download"; return 1; }
+  done
+  if [[ -f $RELEASE_PUB ]]; then key="$RELEASE_PUB"                                   # pinned: signature is mandatory
+  elif [[ -f $d/release.pub && -f $d/SHA256SUMS.sig ]]; then key="$d/release.pub"     # first signed release (trust on first use)
+  fi
+  if [[ -n $key ]]; then
+    [[ -s $d/SHA256SUMS.sig ]] || { err "this release is not signed, but a release key is pinned in $RELEASE_PUB - refusing"; return 1; }
+    if ! { base64 -d <"$d/SHA256SUMS.sig" >"$d/.sig.bin" 2>/dev/null &&
+           openssl dgst -sha256 -verify "$key" -signature "$d/.sig.bin" "$d/SHA256SUMS" >/dev/null 2>&1; }; then
+      rm -f "$d/.sig.bin"; err "signature verification FAILED - refusing to install"; return 1
+    fi
+    rm -f "$d/.sig.bin"; ok "Signature OK"
+  else
+    warn "This release is not signed (no release key pinned yet): only checksums were verified."
+  fi
+  return 0
+}
+
+cmd_update() {
+  need_root
+  local src="" force=0 yes=0 check=0 notify=0 saveonly=0 base="" a latest new cur d rc flags=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1 ;; --yes|-y) yes=1 ;; --check) check=1 ;; --notify) notify=1 ;;
+      --save-only) saveonly=1 ;;
+      --base) base="${2:-}"; shift ;;
+      *) src="$1" ;;
+    esac
+    shift
+  done
+  cfg_load
+  if [[ -n $base ]]; then
+    update_base_ok "$base" || die "Invalid update source. Only https:// (or file://) URLs are accepted - plain http:// would let anyone on the network replace the update."
+    base="${base%/}"; cfg_set UPDATE_BASE "$base"; UPDATE_BASE="$base"; ok "Update source saved: $base"
+    [[ $saveonly == 1 ]] && return 0
+  fi
+  [[ $notify == 1 ]] && flags+=(--notify)
+  cur="$VERSION"
+
+  # --- local folder (cloned repo): the admin chose this code, so it is trusted as-is
+  if [[ -n $src ]]; then
+    [[ -d $src ]] || die "Give a cloned repo folder. (Updating from an installer file/URL was removed: it executed unverified code as root. For a remote source use: vpn update --base https://...)"
+    [[ -f $src/install.sh && -f $src/vpn && -f $src/VERSION ]] || die "$src is not an ikev2-manager repo folder."
+    new=$(tr -d '[:space:]' <"$src/VERSION")
+    say "Installed: $cur   Folder: $new"
+    if [[ $yes == 0 ]]; then read -rp "Install this version? [y/N] " a; [[ $a == y || $a == Y ]] || die "Cancelled."; fi
+    bash "$src/install.sh" --upgrade --from "$src" "${flags[@]}"; return $?
+  fi
+
+  # --- remote update
+  [[ -n ${UPDATE_BASE:-} ]] || die "No update source configured. Run: vpn update --base $D_UPDATE_BASE --save-only"
+  update_base_ok "$UPDATE_BASE" || die "Refusing to update from an insecure source ($UPDATE_BASE). Use: vpn update --base https://..."
+  latest=$(curl_get "$UPDATE_BASE/VERSION" 2>/dev/null | tr -d '[:space:]') || die "Could not reach $UPDATE_BASE/VERSION"
+  [[ $latest =~ $VERSION_RE ]] || die "Remote VERSION file is not valid: '$latest'"
+  if [[ $check == 1 ]]; then      # informational only (unverified); installing always verifies
+    printf 'installed=%s\nlatest=%s\n' "$cur" "$latest"
+    if version_older "$cur" "$latest"; then say "Update available: $cur -> $latest  (run: sudo vpn update)"
+    elif [[ $cur == "$latest" ]]; then say "Up to date."
+    else say "Installed version ($cur) is newer than the source ($latest)."; fi
+    return 0
+  fi
+  say "Installed version: $cur"; say "Latest version:    $latest"
+  if [[ $latest == "$cur" && $force == 0 ]]; then ok "Already up to date (use --force to reinstall)."; return 0; fi
+
+  d=$(mktemp -d "${TMPDIR:-/tmp}/ikev2-update.XXXXXX") || die "mktemp failed"; chmod 700 "$d"
+  say "Downloading and verifying the release..."
+  if ! release_fetch "$UPDATE_BASE" "$d"; then rm -rf "$d"; die "Download failed - nothing was changed."; fi
+  if ! release_verify "$d"; then rm -rf "$d"; die "Verification FAILED - nothing was installed."; fi
+  new=$(tr -d '[:space:]' <"$d/VERSION")
+  [[ $new =~ $VERSION_RE ]] || { rm -rf "$d"; die "The release VERSION file is not valid."; }
+  if [[ $new == "$cur" && $force == 0 ]]; then rm -rf "$d"; ok "Already up to date (use --force to reinstall)."; return 0; fi
+  if version_older "$new" "$cur" && [[ $force == 0 ]]; then rm -rf "$d"; die "The release ($new) is older than the installed version. Use --force to downgrade."; fi
+  if [[ $yes == 0 ]]; then
+    read -rp "Verified release $new. Install it now? Users, certificates and settings are kept. [y/N] " a
+    [[ $a == y || $a == Y ]] || { rm -rf "$d"; die "Cancelled."; }
+  fi
+  bash "$d/install.sh" --upgrade --from "$d" --verified "${flags[@]}"; rc=$?
+  rm -rf "$d"; return $rc
+}
+
+# ------------------------------------------------------------ uninstall
+cmd_uninstall() {
+  need_root
+  local purge=0 yes=0 a ans
+  for a in "$@"; do case "$a" in --purge) purge=1 ;; --yes) yes=1 ;; esac; done
+  if [[ $yes == 0 ]]; then
+    warn "This removes the VPN manager, bot, firewall rules and VPN configuration."
+    [[ $purge == 1 ]] && warn "--purge also removes strongSwan packages and ALL data in $ETC (users, CA, keys)."
+    read -rp "Type YES to continue: " ans
+    [[ $ans == YES ]] || die "Aborted."
+  fi
+  step "Creating a final backup"
+  cmd_backup || true
+  step "Stopping services"
+  systemctl disable --now ikev2-bot ikev2-certcheck.timer ikev2-net >/dev/null 2>&1 || true
+  net_clear
+  rm -f "$UNIT_DIR"/ikev2-{net,bot,certcheck}.service "$UNIT_DIR/ikev2-certcheck.timer"
+  systemctl daemon-reload
+  rm -f "$SWAN/swanctl.conf" "$SWAN/swanctl.conf.bak" "$SWAN/x509/server.pem" "$SWAN/x509ca/ikev2-ca.pem" \
+        "$SWAN/private/server.key" "$SWAN/x509ica/le-chain.pem" "$SYSCTL_D/99-ikev2.conf" "$CHARON_D/ikev2-manager.conf"
+  if [[ $purge == 1 ]]; then
+    step "Removing packages and data"
+    systemctl disable --now "$(svc_name)" >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y strongswan strongswan-swanctl strongswan-pki charon-systemd \
+      libcharon-extra-plugins libcharon-extauth-plugins >>"$LOGFILE" 2>&1 || true
+    rm -rf "$ETC" "$VAR" "$EXPORTS"     # $EXPORTS holds client profiles that contain passwords
+    rm -f "$LOGFILE"
+  else
+    svc_restart 2>/dev/null || true
+    [[ -d $EXPORTS ]] && warn "Client profiles (they contain passwords) remain in $EXPORTS - delete them if you no longer need them."
+  fi
+  rm -rf "$OPT"
+  ok "Uninstalled. Final backup is in $BACKUPS"
+  rm -f "$BIN_PATH"
+}
+
+# ------------------------------------------------------------ text UI (plain numbered menus, no extra packages)
+ui_tty()   { [[ -t 0 && -t 1 ]]; }
+ui_clear() { if ui_tty; then printf '\033[H\033[2J\033[3J'; fi; return 0; }
+ui_pause() { local _; read -rp " Press Enter to continue... " _ || true; }
+
+ui_header() { # title
+  ui_clear
+  local w=42 line
+  line=$(printf '═%.0s' $(seq 1 $w))
+  printf '%s ╔%s╗\n ║ %-*s ║\n ╚%s╝%s\n' "$(c '1;36')" "$line" $((w-2)) "$1" "$line" "$(c 0)"
+}
+
+ui_item() { printf '  %s%s)%s %s\n' "$(c '1;33')" "$1" "$(c 0)" "$2"; }
+
+ui_choose() { # sets CHOICE
+  local ans
+  printf '\n'
+  if ! read -rp " Select: " ans; then CHOICE=0; echo; return; fi
+  CHOICE="${ans//[[:space:]]/}"
+}
+
+ui_ask() { # prompt [default]  -> prints value
+  local v
+  read -rp " $1${2:+ [$2]}: " v || v=""
+  printf '%s' "${v:-${2:-}}"
+}
+
+ui_yesno() { # prompt [default y|n] -> 0 = yes
+  local d="${2:-n}" a
+  read -rp " $1 [$([[ $d == y ]] && echo Y/n || echo y/N)] " a || a=""
+  a="${a:-$d}"
+  [[ $a == y || $a == Y ]]
+}
+
+ui_run() { echo; ( "$@" ); local rc=$?; echo; [[ $rc -eq 0 ]] || warn "(finished with errors)"; ui_pause; }
+
+ui_show() { echo; printf '%s\n' "$1"; echo; ui_pause; }
+
+ui_dash() {
+  cfg_load
+  local svc users on dot
+  svc=$(svc_active); users=$(user_count)
+  on=$(python3 "$OPT/ikev2lib.py" count 2>/dev/null || echo 0)
+  if [[ $svc == active ]]; then dot="$(c 32)● running$(c 0)"; else dot="$(c 31)● ${svc:-unknown}$(c 0)"; fi
+  printf ' Server : %s (%s mode)\n Service: %s\n Users  : %s     Online now: %s\n' "$SERVER_NAME" "$MODE" "$dot" "$users" "$on"
+}
+
+ui_pick_user() { # sets PICKED
+  PICKED=""
+  local lines=() i=1 n s l ans
+  while IFS='|' read -r n s _; do lines+=("$n|$s"); done < <(cmd_user_list --plain)
+  if [[ ${#lines[@]} -eq 0 ]]; then warn " No users yet."; ui_pause; return 1; fi
+  echo
+  for l in "${lines[@]}"; do ui_item "$i" "${l%%|*}  $(c 2)(${l##*|})$(c 0)"; i=$((i+1)); done
+  ui_item 0 "Cancel"
+  read -rp " Select user: " ans || return 1
+  [[ $ans =~ ^[0-9]+$ && $ans -ge 1 && $ans -le ${#lines[@]} ]] || return 1
+  PICKED="${lines[$((ans-1))]%%|*}"
+}
+
+# ---- users
+tui_profile() { # name
+  local name="$1" dir out
+  while true; do
+    ui_header "Profile: $name"
+    echo
+    ui_item 1 "Show connection info (server / user / password)"
+    ui_item 2 "Export profile files (Android, iPhone, Windows)"
+    ui_item 3 "Show CA certificate text (to copy by hand)"
+    ui_item 4 "Show ZedSecure import link"
+    ui_item 0 "Back"
+    ui_choose
+    case $CHOICE in
+      1) ui_show "$( (cmd_user_show "$name") 2>&1 )" ;;
+      2) dir="$EXPORTS/$name"
+         if out=$( (profile_make "$name" "$dir") 2>&1 ); then
+           ui_show "Saved in: $dir
+$(ls -1 "$dir")
+
+Download them from your computer, for example:
+  scp -i KEY.pem USER@$SERVER_NAME:$dir/* .
+Or just use the Telegram bot: it sends the files directly."
+         else ui_show "$out"; fi ;;
+      3) ui_show "$( (cmd_ca) 2>&1 )" ;;
+      4) ui_show "Copy the whole link and import it from the clipboard in ZedSecure:
+
+$( (cmd_zed "$name") 2>&1 )
+
+(Without password: vpn zed $name --nopw)" ;;
+      0|"") return ;;
+    esac
+  done
+}
+
+tui_users() {
+  local name pass out
+  while true; do
+    ui_header "Users & profiles"
+    echo; cmd_user_list; echo
+    ui_item 1 "Add user"
+    ui_item 2 "Profile / connection info"
+    ui_item 3 "Enable or disable a user"
+    ui_item 4 "Change password"
+    ui_item 5 "Delete user"
+    ui_item 0 "Back"
+    ui_choose
+    case $CHOICE in
+      1) echo; name=$(ui_ask "New username (letters, digits, _ . -)"); echo
+         [[ -n $name ]] || continue
+         pass=$(ui_ask "Password (Enter = random)"); echo
+         out=$( cmd_user_add "$name" ${pass:+"$pass"} 2>&1 ); ui_show "$out" ;;
+      2) ui_pick_user && tui_profile "$PICKED" ;;
+      3) ui_pick_user || continue
+         if [[ $(user_get "$PICKED" 3) == enabled ]]; then out=$( cmd_user_setstatus "$PICKED" disabled 2>&1 )
+         else out=$( cmd_user_setstatus "$PICKED" enabled 2>&1 ); fi
+         ui_show "$out" ;;
+      4) ui_pick_user || continue
+         echo; pass=$(ui_ask "New password (Enter = random)"); echo
+         out=$( cmd_user_passwd "$PICKED" ${pass:+"$pass"} 2>&1 ); ui_show "$out" ;;
+      5) ui_pick_user || continue
+         echo
+         if ui_yesno "Delete '$PICKED'? This cannot be undone." n; then
+           out=$( cmd_user_del "$PICKED" 2>&1 ); ui_show "$out"
+         fi ;;
+      0|"") return ;;
+    esac
+  done
+}
+
+# ---- status
+tui_status() {
+  local on
+  ui_header "Status"
+  echo; cmd_status
+  on=$(python3 "$OPT/ikev2lib.py" online 2>/dev/null)
+  echo; echo " Connected clients (user | ip | vpn-ip | time | down | up):"
+  if [[ -n $on ]]; then printf '   %s\n' "$on"; else echo "   none"; fi
+  echo; ui_pause
+}
+
+# ---- server
+tui_server() {
+  local d e
+  while true; do
+    ui_header "Server, certificates, domain"
+    echo
+    ui_item 1 "Restart VPN service"
+    ui_item 2 "Show recent VPN logs"
+    ui_item 3 "Update strongSwan (apt)"
+    ui_item 4 "Certificate info"
+    ui_item 5 "Renew / re-issue certificate"
+    ui_item 6 "Switch to a domain (Let's Encrypt)"
+    ui_item 7 "Switch back to IP mode"
+    ui_item 8 "Re-detect public IP (IP mode)"
+    ui_item 0 "Back"
+    ui_choose
+    case $CHOICE in
+      1) ui_run cmd_restart ;;
+      2) ui_show "$(cmd_logs 60)" ;;
+      3) ui_run cmd_upgrade_strongswan ;;
+      4) ui_show "$( (cmd_cert info) 2>&1 )" ;;
+      5) ui_run cmd_cert renew ;;
+      6) echo; d=$(ui_ask "Domain (its A record must point to this server)"); echo
+         [[ -n $d ]] || continue
+         e=$(ui_ask "Email for Let's Encrypt (optional)"); echo
+         ui_run cmd_domain set "$d" "$e" ;;
+      7) echo; if ui_yesno "Switch back to IP + own CA? Clients need new profiles." n; then ui_run cmd_domain unset; fi ;;
+      8) ui_run cmd_ip refresh ;;
+      0|"") return ;;
+    esac
+  done
+}
+
+# ---- bot
+tui_bot() {
+  local tok aid
+  while true; do
+    ui_header "Telegram bot (admin only)"
+    echo; cmd_bot status 2>&1; echo
+    ui_item 1 "Set bot token + admin id (and start)"
+    ui_item 2 "Send a test message"
+    ui_item 3 "Enable bot service"
+    ui_item 4 "Disable bot service"
+    ui_item 5 "Show bot logs"
+    ui_item 0 "Back"
+    ui_choose
+    case $CHOICE in
+      1) echo
+         echo " 1) In Telegram open @BotFather, send /newbot, copy the token."
+         echo " 2) Open @userinfobot to get YOUR numeric id."
+         echo " 3) Open your new bot and press Start."
+         echo
+         tok=$(ui_ask "Bot token"); echo
+         aid=$(ui_ask "Your numeric Telegram id"); echo
+         [[ -n $tok && -n $aid ]] && ui_run cmd_bot setup "$tok" "$aid" ;;
+      2) ui_run cmd_bot test ;;
+      3) ui_run cmd_bot on ;;
+      4) ui_run cmd_bot off ;;
+      5) ui_show "$(journalctl -u ikev2-bot -n 40 --no-pager 2>&1)" ;;
+      0|"") return ;;
+    esac
+  done
+}
+
+# ---- security
+tui_security() {
+  local p
+  while true; do
+    cfg_load
+    ui_header "Security"
+    echo; echo " Firewall: $FIREWALL   SSH ports: $FW_SSH_PORTS"; echo
+    ui_item 1 "Enable firewall (inbound: SSH + VPN only)"
+    ui_item 2 "Disable firewall"
+    ui_item 3 "Change allowed SSH ports"
+    ui_item 4 "Install / enable fail2ban (SSH)"
+    ui_item 5 "Enable automatic security updates"
+    ui_item 0 "Back"
+    ui_choose
+    case $CHOICE in
+      1) echo " Allowed inbound: SSH ports ($(fw_ssh_ports)), UDP 500/4500. Everything else is dropped."
+         echo " A wrong SSH port can lock you out of NEW sessions."
+         echo; if ui_yesno "Enable the firewall?" n; then ui_run cmd_fw on; fi ;;
+      2) ui_run cmd_fw off ;;
+      3) echo; p=$(ui_ask "SSH ports (space separated)" "$FW_SSH_PORTS"); echo
+         [[ -n $p ]] && ui_run cmd_fw ports "$p" ;;
+      4) ui_run sec_fail2ban ;;
+      5) ui_run sec_autoupdate ;;
+      0|"") return ;;
+    esac
+  done
+}
+
+# ---- backup
+tui_backup() {
+  local items=() x i ans
+  while true; do
+    ui_header "Backup & restore"
+    echo; echo " Folder: $BACKUPS"; echo
+    ui_item 1 "Create backup now (local, root-only)"
+    ui_item 2 "Create ENCRYPTED backup (safe to copy off the server)"
+    ui_item 3 "Backup encryption key (status / create)"
+    ui_item 4 "List backups"
+    ui_item 5 "Restore a backup"
+    ui_item 0 "Back"
+    ui_choose
+    case $CHOICE in
+      1) ui_run cmd_backup ;;
+      2) ui_run cmd_backup --encrypt ;;
+      3) echo; cmd_backup key show; echo
+         if [[ ! -f $BACKUP_PUB ]] && ui_yesno "Create a key pair now? (the private key is shown ONCE - you must save it)" n; then ui_run cmd_backup key init
+         else ui_pause; fi ;;
+      4) ui_show "$(cmd_backups || true)" ;;
+      5) items=(); while read -r x; do [[ -n $x ]] && items+=("$x"); done < <(cmd_backups)
+         if [[ ${#items[@]} -eq 0 ]]; then warn " No backups found."; ui_pause; continue; fi
+         echo; i=1; for x in "${items[@]}"; do ui_item "$i" "$(basename "$x")"; i=$((i+1)); done; ui_item 0 "Cancel"
+         read -rp " Select backup: " ans || continue
+         [[ $ans =~ ^[0-9]+$ && $ans -ge 1 && $ans -le ${#items[@]} ]] || continue
+         echo; if ui_yesno "Restore $(basename "${items[$((ans-1))]}")? Current users/certs are overwritten (a safety copy is made first)." n; then
+           if [[ ${items[$((ans-1))]} == *.enc ]]; then
+             x=$(ui_ask "Path to your backup PRIVATE key"); echo
+             [[ -n $x ]] && ui_run cmd_restore "${items[$((ans-1))]}" --key "$x"
+           else
+             ui_run cmd_restore "${items[$((ans-1))]}"
+           fi
+         fi ;;
+      0|"") return ;;
+    esac
+  done
+}
+
+# ---- updates
+tui_update() {
+  local s
+  while true; do
+    cfg_load
+    ui_header "Updates"
+    echo; echo " Tool version: $VERSION   strongSwan: $(sw_version)"
+    echo " Update source: ${UPDATE_BASE:-(not set)}"; echo
+    ui_item 1 "Check for a new version of this tool"
+    ui_item 2 "Update this tool now (downloaded, verified, then installed)"
+    ui_item 3 "Update from a local folder (cloned repo)"
+    ui_item 4 "Update strongSwan (apt)"
+    ui_item 5 "Change update source URL"
+    ui_item 0 "Back"
+    ui_choose
+    case $CHOICE in
+      1) ui_run cmd_update --check ;;
+      2) ui_run cmd_update ;;
+      3) echo; s=$(ui_ask "Path to a repo folder"); echo
+         [[ -n $s ]] && ui_run cmd_update "$s" ;;
+      4) ui_run cmd_upgrade_strongswan ;;
+      5) echo; s=$(ui_ask "Raw base URL (default: official repo)" "${UPDATE_BASE:-$D_UPDATE_BASE}"); echo
+         [[ -n $s ]] && ui_run cmd_update --base "$s" --save-only ;;
+      0|"") return ;;
+    esac
+  done
+}
+
+# ---- main menu
+tui_main() {
+  need_root
+  ui_tty || die "The menu needs an interactive terminal. CLI help: vpn help"
+  [[ -f $CONF ]] || die "Not installed yet. Run the installer first."
+  while true; do
+    ui_header "IKEv2 VPN Manager  v$VERSION"
+    echo; ui_dash; echo
+    ui_item 1 "Users & client profiles"
+    ui_item 2 "Status & connected clients"
+    ui_item 3 "Server, certificates, domain"
+    ui_item 4 "Advanced strongSwan settings (DNS, proposals, timers, raw)"
+    ui_item 5 "Telegram bot"
+    ui_item 6 "Security (firewall, fail2ban, auto-updates)"
+    ui_item 7 "Backup & restore"
+    ui_item 8 "Updates"
+    ui_item 9 "Uninstall"
+    ui_item 0 "Exit"
+    ui_choose
+    case $CHOICE in
+      1) tui_users ;;
+      2) tui_status ;;
+      3) tui_server ;;
+      4) tui_advanced ;;
+      5) tui_bot ;;
+      6) tui_security ;;
+      7) tui_backup ;;
+      8) tui_update ;;
+      9) echo; warn " This removes the VPN manager, bot and firewall rules (a final backup is made first)."
+         if [[ $(ui_ask "Type YES to continue") == YES ]]; then ui_run cmd_uninstall --yes; exit 0; fi ;;
+      0|"") ui_clear; return ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------ help / main
+cmd_help() {
+  cat <<EOF
+IKEv2 Manager v$VERSION  -  run 'sudo vpn' for the text menu
+
+Users
+  vpn user list | add NAME [PASS|--stdin] | del NAME | enable NAME | disable NAME
+  vpn user passwd NAME [PASS|auto|--stdin] | show NAME      (passwords: 12+ chars; --stdin keeps them out of ps)
+  vpn profile NAME [DIR]       write .sswan / .mobileconfig / windows script
+  vpn zed NAME [--nopw]        ZedSecure import link (zedsecure://...)
+  vpn ca                       print CA certificate (IP mode)
+Server
+  vpn status | online | restart | logs [N]
+  vpn cert info|renew|auto     vpn domain set DOMAIN [EMAIL] | unset
+  vpn ip refresh               vpn upgrade-strongswan
+Advanced strongSwan settings
+  vpn get [KEY]                list settings (DNS, pool, routes, proposals, timers, ...)
+  vpn set KEY VALUE            change one (VALUE "default" resets), applied + validated
+  vpn preset dns cloudflare|google|quad9|adguard|cloudflare-family|opendns|list
+  vpn preset ike compat|strict-sha2     vpn reset [--yes]
+  security knobs: CLIENT_ISOLATION, BLOCK_PRIVATE, IKE_RATE_LIMIT, IPV6_BLOCK  (see: vpn get)
+  vpn raw list|show|edit|set|clear NAME  add ANY strongSwan option (connection, local,
+                               remote, child, pools, extra, charon)
+  vpn conf show|apply          view / regenerate the final swanctl.conf
+Security
+  vpn fw on|off|status|ports "22 2222"     vpn security fail2ban|autoupdate
+Bot
+  vpn bot setup TOKEN|- ADMIN_ID | on | off | status | test | logs   ('-' reads the token from stdin)
+Maintenance
+  vpn backup [--encrypt] | backups | restore FILE [--key PRIVATE_KEY.pem]
+  vpn backup key init|set CERT.pem|show|remove    vpn backup decrypt FILE.enc KEY.pem [OUT]
+  vpn update [--check] [--yes] [--force]     download + verify (checksums, signature) + install
+  vpn update --base https://RAW_URL --save-only   set the update source (https only)
+  vpn update FOLDER                          update from a local repo folder
+  vpn uninstall [--purge] [--yes]
+  vpn version
+EOF
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    ""|help|-h|--help|version|-v|--version) ;;
+    *) need_root ;;
+  esac
+  case "$cmd" in
+    "")                 tui_main ;;
+    help|-h|--help)     cmd_help ;;
+    version|-v|--version) say "ikev2-manager $VERSION" ;;
+    status)             cmd_status "$@" ;;
+    online)             cmd_online ;;
+    user)               cmd_user "$@" ;;
+    profile)            cmd_profile "$@" ;;
+    ca)                 cmd_ca ;;
+    zed)                cmd_zed "$@" ;;
+    restart)            cmd_restart ;;
+    logs)               cmd_logs "$@" ;;
+    cert)               cmd_cert "$@" ;;
+    domain)             cmd_domain "$@" ;;
+    ip)                 cmd_ip "$@" ;;
+    upgrade-strongswan) cmd_upgrade_strongswan ;;
+    fw)                 cmd_fw "$@" ;;
+    security)           cmd_security "$@" ;;
+    bot)                cmd_bot "$@" ;;
+    backup)             cmd_backup "$@" ;;
+    backups)            cmd_backups ;;
+    restore)            cmd_restore "$@" ;;
+    update)             cmd_update "$@" ;;
+    get)                cmd_get "$@" ;;
+    set)                cmd_set "$@" ;;
+    reset)              cmd_reset "$@" ;;
+    preset)             cmd_preset "$@" ;;
+    raw)                cmd_raw "$@" ;;
+    conf)               cmd_conf "$@" ;;
+    uninstall)          cmd_uninstall "$@" ;;
+    net)                if [[ ${1:-} == apply ]]; then net_apply; else die "Usage: vpn net apply"; fi ;;
+    setup)              cmd_setup "$@" ;;
+    migrate)            cmd_migrate ;;
+    selftest)           cmd_selftest ;;
+    *) err "Unknown command: $cmd"; cmd_help; exit 1 ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi

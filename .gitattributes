@@ -1,0 +1,4 @@
+# keep shell/python files with Unix line endings on every platform (CRLF would break the scripts and the checksums)
+* text=auto eol=lf
+*.zip binary
+*.enc binary

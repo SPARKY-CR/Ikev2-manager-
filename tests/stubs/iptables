@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Stateful iptables/ip6tables stub for the test-suite (no kernel access).
+State lives in $STUB_STATE/<cmd>.json, every call is appended to calls.log."""
+import json, os, sys
+cmd = os.path.basename(sys.argv[0])
+sd = os.environ.get("STUB_STATE", "/tmp/stub"); os.makedirs(sd, exist_ok=True)
+path = os.path.join(sd, cmd + ".json")
+args = sys.argv[1:]
+with open(os.path.join(sd, "calls.log"), "a") as f:
+    f.write(cmd + " " + " ".join(args) + "\n")
+bad = os.environ.get("STUB_IPT_FAIL", "")
+if bad and bad in " ".join(args):
+    print(cmd + ": simulated failure", file=sys.stderr); sys.exit(1)
+try: st = json.load(open(path))
+except Exception: st = {}
+table = "filter"
+if args[:1] == ["-t"]: table, args = args[1], args[2:]
+BUILTIN = {"filter": ["INPUT", "FORWARD", "OUTPUT"],
+           "nat": ["PREROUTING", "INPUT", "OUTPUT", "POSTROUTING"],
+           "mangle": ["PREROUTING", "INPUT", "FORWARD", "OUTPUT", "POSTROUTING"]}
+t = st.setdefault(table, {c: [] for c in BUILTIN.get(table, [])})
+def save(): json.dump(st, open(path, "w"))
+def need(c):
+    if c not in t:
+        print(cmd + ": No chain/target/match by that name.", file=sys.stderr); sys.exit(1)
+op = args[0] if args else ""
+if op == "-N":
+    if args[1] in t: print("Chain already exists.", file=sys.stderr); sys.exit(1)
+    t[args[1]] = []; save()
+elif op == "-F":
+    if len(args) > 1: need(args[1]); t[args[1]] = []
+    else:
+        for c in t: t[c] = []
+    save()
+elif op == "-X":
+    need(args[1])
+    for c, rules in t.items():
+        for r in rules:
+            if r.split("-j ")[-1].split()[0:1] == [args[1]]:
+                print("Too many links.", file=sys.stderr); sys.exit(1)
+    del t[args[1]]; save()
+elif op in ("-A", "-I"):
+    need(args[1]); rest = args[2:]; pos = 1
+    if op == "-I" and rest and rest[0].isdigit(): pos, rest = int(rest[0]), rest[1:]
+    rule = " ".join(rest)
+    if op == "-A": t[args[1]].append(rule)
+    else: t[args[1]].insert(pos - 1, rule)
+    save()
+elif op == "-D":
+    need(args[1]); rule = " ".join(args[2:])
+    if rule in t[args[1]]: t[args[1]].remove(rule); save()
+    else: print("Bad rule (does a matching rule exist in that chain?).", file=sys.stderr); sys.exit(1)
+elif op == "-C":
+    need(args[1]); sys.exit(0 if " ".join(args[2:]) in t[args[1]] else 1)
+elif op == "-S":
+    for c in ([args[1]] if len(args) > 1 else list(t)):
+        need(c)
+        print(("-P %s ACCEPT" if c in sum(BUILTIN.values(), []) else "-N %s") % c)
+        for r in t[c]: print("-A %s %s" % (c, r))
+sys.exit(0)

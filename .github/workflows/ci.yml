@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax checks
+        run: |
+          bash -n vpn
+          bash -n install.sh
+          bash -n tools/release.sh
+          python3 -m py_compile bot.py ikev2lib.py
+
+      - name: ShellCheck (advisory)
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning vpn install.sh tools/release.sh
+
+      - name: Tests (shell + python; system tools are stubbed)
+        run: bash tests/run_all.sh
+
+      - name: Release files are consistent
+        run: |
+          # SHA256SUMS must match the files in this commit; when a signature is present it must verify too
+          sha256sum -c SHA256SUMS
+          if [ -f SHA256SUMS.sig ] && [ -f release.pub ]; then bash tools/release.sh verify; fi

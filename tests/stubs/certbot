@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+echo "certbot $*" >>"${STUB_STATE:-/tmp}/calls.log" 2>/dev/null
+[[ $* == *"--help certonly"* ]] && echo "--key-type"
+dom=""; prev=""
+for a in "$@"; do [[ $prev == -d ]] && dom="$a"; prev="$a"; done
+if [[ -n $dom && -n ${IKEV2_LE:-} ]]; then
+  d="$IKEV2_LE/live/$dom"; mkdir -p "$d"
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$d/privkey.pem" -out "$d/cert.pem" -days 90 -subj "/CN=$dom" -addext "subjectAltName=DNS:$dom" 2>/dev/null
+  cp "$d/cert.pem" "$d/chain.pem"
+fi
+exit 0
