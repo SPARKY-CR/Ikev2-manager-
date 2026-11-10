@@ -2,12 +2,15 @@
 
 # Ikev2-manager
 
+[![CI](https://github.com/SPARKY-CR/Ikev2-manager-/actions/workflows/ci.yml/badge.svg)](https://github.com/SPARKY-CR/Ikev2-manager-/actions/workflows/ci.yml) **نسخه‌ی 1.3.0**
+
 **نصب و مدیریت سرور VPN مبتنی بر IKEv2/IPsec (با strongSwan) روی Ubuntu/Debian، با یک دستور.**
 منوی متنی ساده، پروفایل آماده برای اندروید/آیفون/ویندوز/مک، تنظیمات کامل strongSwan و ربات تلگرام مخصوص ادمین.
 
 🇬🇧 [English README](README.en.md)
 
-> ⚠️ **وضعیت پروژه:** نسخه‌ی اولیه‌ی عمومی. اگر مشکلی دیدید لطفاً در بخش Issues گزارش دهید
+> ✅ **وضعیت پروژه:** نسخه‌ی 1.3.0 — تست‌های CI سبز است و نصب روی سرور واقعی آزمایش شده است.
+> اگر مشکلی دیدید لطفاً در بخش Issues گزارش دهید
 > (متن خطا و خروجی `vpn version` را بنویسید، رمز و توکن را **هرگز** ننویسید).
 
 ---
@@ -115,10 +118,10 @@ cd $(basename SPARKY-CR/Ikev2-manager-)
 sudo bash install.sh --from .
 ```
 
-**نسخه‌ی ثابت (پین):** به‌جای `main` می‌توانید یک tag یا commit بدهید. هم آدرس و هم متغیر را بگذارید (فرض کنید tag شما `v1.3.0` است):
+**نسخه‌ی ثابت (پین):** به‌جای `main` می‌توانید یک commit بدهید (در حال حاضر tag منتشر نشده است). هم آدرس و هم متغیر را بگذارید:
 
 ```bash
-sudo IKEV2MGR_BRANCH=v1.3.0 bash -c "$(curl -fsSL https://raw.githubusercontent.com/SPARKY-CR/Ikev2-manager-/v1.3.0/install.sh)"
+sudo IKEV2MGR_BRANCH=32fc719 bash -c "$(curl -fsSL https://raw.githubusercontent.com/SPARKY-CR/Ikev2-manager-/32fc719/install.sh)"
 ```
 
 **بررسی نصب‌کننده قبل از اجرا** (نصب‌کننده نمی‌تواند خودش را راستی‌آزمایی کند؛ ولی هر چیزی که بعد از آن دانلود می‌شود راستی‌آزمایی می‌شود):
