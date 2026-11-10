@@ -23,6 +23,9 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
           shellcheck -S warning vpn install.sh tools/release.sh
 
+      - name: Install xmllint (needed by the mobileconfig test)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libxml2-utils
+
       - name: Tests (shell + python; system tools are stubbed)
         run: bash tests/run_all.sh
 
