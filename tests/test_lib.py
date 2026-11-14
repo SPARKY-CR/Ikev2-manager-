@@ -189,5 +189,85 @@ class KickAndOnline(unittest.TestCase):
         self.assertEqual(cnt, "2")
 
 
+class QuotaLib(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="quotaT.")
+        for x in ("etc", "var"):
+            os.makedirs(os.path.join(self.d, x))
+        os.environ.update(IKEV2_ETC=f"{self.d}/etc", IKEV2_VAR=f"{self.d}/var")
+        open(f"{self.d}/etc/users.db", "w").write("alice:Pw123456789x:enabled:1\nbob:Pw123456789x:enabled:2\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    @staticmethod
+    def sa(user, ike, spi, rx, tx):
+        return {"user": user, "id": ike, "children": [{"spi": spi, "rx": rx, "tx": tx}]}
+
+    def test_parse_sas_keeps_the_children(self):
+        sas = L.parse_sas(SAS)
+        self.assertEqual(sas[0]["children"], [{"spi": "c0a1b2c3", "rx": 1536, "tx": 2048}])
+        self.assertEqual(sas[0]["rx"] + sas[0]["tx"], 3584)
+
+    def test_sizes_and_expiry(self):
+        self.assertEqual(L.parse_size("2G"), 2 * 1024 ** 3)
+        self.assertEqual(L.parse_size("2"), 2 * 1024 ** 3)
+        self.assertEqual(L.parse_size("1.5kb"), 1536)
+        with self.assertRaises(ValueError):
+            L.parse_size("-1")
+        self.assertEqual(L.parse_expiry("never"), 0)
+        self.assertEqual(L.parse_expiry("2", now=1000), 1000 + 2 * 86400)
+        self.assertEqual(L.parse_days("+7d"), 7)
+
+    def test_first_tick_is_a_baseline_then_deltas_are_added(self):
+        L.quota_tick(sas=[self.sa("alice", 1, "aa", 500, 500)])
+        self.assertEqual(L.load_quotas()["alice"]["used"], 0)
+        L.quota_tick(sas=[self.sa("alice", 1, "aa", 800, 700)])
+        self.assertEqual(L.load_quotas()["alice"]["used"], 500)
+        L.quota_tick(sas=[self.sa("alice", 1, "bb", 10, 10)])          # rekey: new SPI counts from zero
+        self.assertEqual(L.load_quotas()["alice"]["used"], 520)
+
+    def test_a_failed_swanctl_query_does_not_reset_the_baseline(self):
+        L.quota_tick(sas=[self.sa("alice", 1, "aa", 100, 0)])
+        orig = L.list_sas_checked
+        L.list_sas_checked = lambda: (False, "")
+        try:
+            L.quota_tick()
+        finally:
+            L.list_sas_checked = orig
+        L.quota_tick(sas=[self.sa("alice", 1, "aa", 150, 0)])
+        self.assertEqual(L.load_quotas()["alice"]["used"], 50, "no double counting after a failed query")
+
+    def test_actions_and_one_shot_events(self):
+        q = L.load_quotas() or {}
+        q["alice"] = L.new_record("alice", limit=1000)
+        L.save_quotas(q)
+        L.quota_tick(sas=[self.sa("alice", 1, "aa", 0, 0)])
+        self.assertEqual(L.quota_tick(sas=[self.sa("alice", 1, "aa", 850, 0)]), [])
+        self.assertEqual([e["kind"] for e in L.take_events()], ["warn_limit"])
+        acts = L.quota_tick(sas=[self.sa("alice", 1, "aa", 1200, 0)])
+        self.assertEqual(acts, [("disable", "alice", "quota")])
+        self.assertEqual([e["kind"] for e in L.take_events()], ["limit"])
+        open(f"{self.d}/etc/users.db", "w").write("alice:Pw123456789x:disabled:1\nbob:Pw123456789x:enabled:2\n")
+        self.assertEqual(L.quota_tick(sas=[]), [], "already disabled: nothing more to do and no second event")
+        self.assertEqual(L.take_events(), [])
+        r = L.load_quotas(); r["alice"]["limit"] = 5000; L.save_quotas(r)
+        self.assertEqual(L.quota_tick(sas=[], do_measure=False), [("enable", "alice", "renewed")])
+
+    def test_expiry_and_delete_action(self):
+        q = {"bob": L.new_record("bob", expires=100, action="delete")}
+        L.save_quotas(q)
+        self.assertEqual(L.quota_tick(sas=[], now=200), [("delete", "bob", "expired")])
+        self.assertIn("bob", L.load_quotas(), "the record is only dropped by `vpn user del`, so a failed delete is retried")
+        self.assertEqual(L.quota_tick(sas=[], now=300), [("delete", "bob", "expired")])
+
+    def test_notify_never_touches_the_user(self):
+        L.save_quotas({"bob": L.new_record("bob", limit=10, action="notify")})
+        L.quota_tick(sas=[self.sa("bob", 1, "aa", 0, 0)])
+        self.assertEqual(L.quota_tick(sas=[self.sa("bob", 1, "aa", 99, 0)]), [])
+        self.assertEqual(L.quota_tick(sas=[self.sa("bob", 1, "aa", 99, 0)], global_action="delete"), [])
+        self.assertEqual([e["kind"] for e in L.take_events()], ["limit"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

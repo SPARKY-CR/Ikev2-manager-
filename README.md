@@ -2,14 +2,14 @@
 
 # Ikev2-manager
 
-[![CI](https://github.com/SPARKY-CR/Ikev2-manager-/actions/workflows/ci.yml/badge.svg)](https://github.com/SPARKY-CR/Ikev2-manager-/actions/workflows/ci.yml) **نسخه‌ی 1.3.0**
+[![CI](https://github.com/SPARKY-CR/Ikev2-manager-/actions/workflows/ci.yml/badge.svg)](https://github.com/SPARKY-CR/Ikev2-manager-/actions/workflows/ci.yml) **نسخه‌ی 1.4.0**
 
 **نصب و مدیریت سرور VPN مبتنی بر IKEv2/IPsec (با strongSwan) روی Ubuntu/Debian، با یک دستور.**
 منوی متنی ساده، پروفایل آماده برای اندروید/آیفون/ویندوز/مک، تنظیمات کامل strongSwan و ربات تلگرام مخصوص ادمین.
 
 🇬🇧 [English README](README.en.md)
 
-> ✅ **وضعیت پروژه:** نسخه‌ی 1.3.0 — تست‌های CI سبز است و نصب روی سرور واقعی آزمایش شده است.
+> ✅ **وضعیت پروژه:** نسخه‌ی 1.4.0 — تست‌های CI سبز است و نصب روی سرور واقعی آزمایش شده است.
 > اگر مشکلی دیدید لطفاً در بخش Issues گزارش دهید
 > (متن خطا و خروجی `vpn version` را بنویسید، رمز و توکن را **هرگز** ننویسید).
 

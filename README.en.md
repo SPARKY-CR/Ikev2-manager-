@@ -270,3 +270,17 @@ Issues and PRs are welcome (test on a throw-away server first). Security issues:
 License: MIT ([LICENSE](LICENSE)); strongSwan is installed separately from your distribution under its own license.
 The software is provided "as is", without warranty. You are responsible for lawful use and for following the rules of your
 country and server provider.
+
+
+## Traffic limit and expiry (1.4.0)
+
+```
+vpn user add alice --limit 20G --days 30        # 20 GB, valid for 30 days
+vpn quota list                                   # usage / limit / expiry for everyone
+vpn quota set alice --limit 50G --expires 2026-12-31 --action delete
+vpn quota add alice --limit 10G --days 30        # renew / extend (re-enables a user the quota disabled)
+vpn quota reset alice                            # usage back to 0
+vpn set DEFAULT_LIMIT 20G; vpn set DEFAULT_DAYS 30; vpn set QUOTA_ACTION disable|delete|notify
+```
+Sizes: `500M`, `10G`, `1.5T` (a bare number means GB), `unlimited`. Expiry: days from now, `YYYY-MM-DD` or `never`.
+A timer checks every 20 s, so enforcement can lag by that much. The Telegram bot offers all of this with buttons.

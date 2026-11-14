@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.4.0 - traffic limit, expiry and a full-featured Telegram bot
+
+### Added
+- **Traffic limit and expiry per user.** `vpn user add NAME --limit 10G --days 30`, `vpn quota list|show|set|add|reset`.
+  Usage is counted by `ikev2-quota.timer` (every 20 s) from the strongSwan counters, correctly across rekeys and
+  reconnects. When a user runs out of traffic or time the configured action runs: `disable` (default; renewing
+  re-enables the user), `delete` or `notify` (only warn). The action can be set globally (`vpn set QUOTA_ACTION`)
+  and per user (`--action`). Defaults for new users: `vpn set DEFAULT_LIMIT 20G`, `vpn set DEFAULT_DAYS 30`.
+  Data lives in `quotas.db` (covered by backups). Enforcement lags by up to ~20 seconds.
+- **Telegram bot**: messages now use Telegram MarkdownV2 (bold, code, expandable quotes, usage bars) with an automatic
+  plain-text fallback. New: add-user wizard (traffic, days, action), per-user usage screen with quick renew buttons, traffic
+  overview, disconnect button, warnings at 80% usage / 3 days before expiry and when a limit is reached, and menus for
+  server (logs, certificate, domain/IP, self-test), security (firewall, SSH ports, fail2ban, auto-updates), all advanced
+  settings, DNS/IKE presets, raw snippets, config view, backup list and restore of plain backups. Destructive actions ask
+  for a second tap. Not in the bot on purpose: uninstall and backup-key handling.
+- Text menu: Users -> Traffic limit & expiry. `vpn user list` shows usage and expiry.
+- Tests: `tests/t_quota.sh` and new bot/library tests.
+
+### Notes
+- The bot is fully bilingual: every new text exists in English and Persian (`TX` / `TX_FA`), with a test that keeps both tables identical.
+- Existing users are unlimited; traffic from before the upgrade is not counted.
+- Manually enabling a user that is over its limit disables it again at the next check (renew it instead).
+
 ## 1.3.0 - security and reliability release (first public release candidate)
 
 ### Fixed bugs

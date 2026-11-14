@@ -55,6 +55,10 @@ class FakeVpn:
             return 0, ""
         if args[:1] == ("zed",):
             return 0, "zedsecure://abc"
+        if args == ("get",):
+            return 0, "SETTING            VALUE\nDNS                1.1.1.1  [default]\nMOBIKE             yes  [default]\nQUOTA_ACTION       disable  [default]"
+        if args[:1] == ("get",):
+            return 0, f"{args[1]} = x\n  accepts: yes | no"
         if args[:1] == ("backup",) and self.on_backup:
             return self.on_backup(args)
         return 0, ""
@@ -75,6 +79,9 @@ class BotCase(unittest.TestCase):
         self.bot.vpn = self.vpn
         self.tg = self.bot.tg
         self.bot.update_state(lambda st: st.__setitem__("lang", "en"))     # the bot defaults to Persian
+
+    def shown(self):
+        return [d for m, d in self.tg.calls if m in ("sendMessage", "editMessageText")][-1]
 
     def msg(self, text, mid=7):
         return {"text": text, "message_id": mid, "chat": {"id": ADMIN, "type": "private"}, "from": {"id": ADMIN}}
@@ -305,6 +312,9 @@ class Texts(BotCase):
             for k, v in self.bot.T[lang].items():
                 names = set(re.findall(r"\{(\w+)\}", v))
                 v.format(**{n: samples[n] for n in names})
+        for table in (self.bot.TX, self.bot.TX_FA):       # the 1.4.0 tables: placeholders are free-form
+            for k, v in table.items():
+                v.format(**{n: "x" for n in re.findall(r"\{(\w+)\}", v)})
 
 
 class ParsingHelpers(BotCase):
@@ -316,6 +326,359 @@ class ParsingHelpers(BotCase):
             return (0, "alice|enabled|1\nbob|disabled|2") if a[:2] == ("user", "list") else orig(*a, **k)
         self.bot.vpn = users
         self.assertEqual(self.bot.list_users(), [("alice", "enabled"), ("bob", "disabled")])
+
+
+def cq(data):
+    return {"id": "1", "from": {"id": ADMIN}, "data": data,
+            "message": {"chat": {"id": ADMIN, "type": "private"}, "message_id": 9}}
+
+
+class Markdown(BotCase):
+    def test_basic_entities_and_escaping(self):
+        c = self.bot.to_mdv2
+        self.assertEqual(c("<b>Users</b> (3)"), r"*Users* \(3\)")
+        self.assertEqual(c("a_b.c-d!"), r"a\_b\.c\-d\!")
+        self.assertEqual(c("<code>x_y.z</code>"), "`x_y.z`")
+        self.assertEqual(c("<code>a`b\\c</code>"), "`a\\`b\\\\c`")
+        self.assertEqual(c("<pre>l1\nl2 (x)</pre>"), "```\nl1\nl2 (x)\n```")
+        self.assertEqual(c("1 &lt; 2 &amp; 3"), r"1 < 2 & 3")
+        self.assertEqual(c('<a href="https://x.y/a(b)">link</a>'), r"[link](https://x.y/a(b\))")
+        self.assertEqual(c("<i>it</i> <tg-spoiler>s</tg-spoiler>"), "_it_ ||s||")
+
+    def test_blockquotes(self):
+        c = self.bot.to_mdv2
+        self.assertEqual(c("<blockquote>a\nb</blockquote>"), ">a\n>b")
+        self.assertEqual(c("<blockquote expandable>a\nb</blockquote>"), "**>a\n>b||")
+
+    def test_unclosed_and_stray_tags_never_raise(self):
+        self.assertEqual(self.bot.to_mdv2("<b>open"), "*open*")
+        self.assertEqual(self.bot.to_mdv2("close</b>"), "close")
+
+    def test_no_reserved_character_is_left_unescaped(self):
+        """Every text of both languages, rendered with awkward values, must be valid MarkdownV2."""
+        reserved = re.compile(r"[\[\]()~#+\-=|{}.!]")
+        evil = "a_b*c[d](e)~f`g>h#i+j-k=l|m{n}o.p!q"
+        texts = list(self.bot.T["en"].values()) + list(self.bot.T["fa"].values()) + list(self.bot.TX.values()) + list(self.bot.TX_FA.values())
+        for t in texts:
+            names = re.findall(r"\{(\w+)\}", t)
+            out = self.bot.to_mdv2(t.format(**{n: self.bot.esc(evil) for n in names}))
+            out = re.sub(r"```.*?```", "", out, flags=re.S)
+            out = re.sub(r"\\.", "", out)
+            out = re.sub(r"`[^`]*`", "", out)
+            out = out.replace("**>", "").replace("||", "")
+            out = re.sub(r"(?m)^>", "", out)
+            self.assertIsNone(reserved.search(out), f"unescaped character in: {t[:60]!r} -> {out[:120]!r}")
+
+    def test_messages_are_sent_as_markdownv2(self):
+        self.bot.send("<b>x</b> a.b")
+        d = self.tg.methods("sendMessage")[-1]
+        self.assertEqual(d["parse_mode"], "MarkdownV2")
+        self.assertEqual(d["text"], r"*x* a\.b")
+
+    def test_a_formatting_error_falls_back_to_plain_text(self):
+        calls = []
+
+        def call(method, data=None, timeout=40):
+            calls.append((method, dict(data or {})))
+            if len(calls) == 1:
+                return {"ok": False, "error_code": 400, "description": "Bad Request: can't parse entities: ..."}
+            return {"ok": True, "result": {"message_id": 1}}
+        self.tg.call = call
+        self.bot.send("<b>Hello</b> &lt;x&gt;")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("parse_mode", calls[1][1])
+        self.assertEqual(calls[1][1]["text"], "Hello <x>")
+
+    def test_new_texts_exist_in_both_languages_with_the_same_placeholders(self):
+        self.assertEqual(sorted(set(self.bot.TX) ^ set(self.bot.TX_FA)), [])
+        for k, v in self.bot.TX.items():
+            self.assertEqual(sorted(re.findall(r"\{(\w+)\}", v)), sorted(re.findall(r"\{(\w+)\}", self.bot.TX_FA[k])), k)
+
+    def test_persian_mode_uses_the_persian_texts(self):
+        self.bot.update_state(lambda st: st.__setitem__("lang", "fa"))
+        self.assertEqual(self.bot.tr("b_quota"), self.bot.TX_FA["b_quota"])
+        self.assertIn("\u062d", self.bot.quota_block(self.bot.qrec("alice")))
+        self.assertIn("\u0647\u0631\u06af\u0632", self.bot.exp_text(0))
+        self.bot.update_state(lambda st: st.__setitem__("lang", "en"))
+        self.assertEqual(self.bot.tr("b_quota"), self.bot.TX["b_quota"])
+
+
+class Quota(BotCase):
+    def setUp(self):
+        super().setUp()
+        self.bot.run_thread = lambda fn, *a: fn(*a)          # run the worker threads inline
+        open(os.path.join(self.tmp, "etc", "users.db"), "w").write("alice:Pw:enabled:1\nbob:Pw:disabled:2\n")
+        orig = self.vpn.__call__
+
+        def users(*a, **k):
+            if a[:2] == ("user", "list"):
+                return 0, "alice|enabled|1\nbob|disabled|2"
+            return orig(*a, **k)
+        self.bot.vpn = users
+        self.calls = lambda: [c[0] for c in self.vpn.calls]
+
+    def q(self, name, **kw):
+        import ikev2lib as L
+        qs = L.load_quotas()
+        r = qs.get(name) or L.new_record(name)
+        r.update(kw)
+        qs[name] = r
+        L.save_quotas(qs)
+
+    def test_user_view_shows_usage_and_expiry(self):
+        import time as _t
+        self.q("alice", limit=10 * 1024 ** 3, used=3 * 1024 ** 3, expires=int(_t.time()) + 5 * 86400)
+        self.bot.show_user(None, "alice")
+        text = self.tg.methods("sendMessage")[-1]["text"]
+        self.assertIn("30%", text)
+        self.assertIn("3\\.0 GB", text)
+        self.assertIn("5d left", text.replace("\\", ""))
+        buttons = [b["callback_data"] for row in self.tg.methods("sendMessage")[-1]["reply_markup"]["inline_keyboard"] for b in row]
+        self.assertIn("q:v:alice", buttons)
+        self.assertIn("u:k:alice", buttons)
+
+    def test_overview_lists_users_most_used_first(self):
+        self.q("bob", limit=1024 ** 3, used=900 * 1024 ** 2)
+        self.q("alice", limit=1024 ** 3, used=100 * 1024 ** 2)
+        self.bot.show_quotas(None)
+        text = self.tg.methods("sendMessage")[-1]["text"]
+        self.assertLess(text.index("bob"), text.index("alice"))
+        self.assertTrue(text.count("**>") == 1, "the list is one expandable quote")
+
+    def test_quick_buttons_call_the_cli(self):
+        self.bot.handle({"callback_query": cq("q:g:alice:10G")})
+        self.assertIn(("quota", "add", "alice", "--limit", "10G"), self.calls())
+        self.bot.handle({"callback_query": cq("q:y:alice:30")})
+        self.assertIn(("quota", "add", "alice", "--days", "30"), self.calls())
+        self.bot.handle({"callback_query": cq("q:g0:alice")})
+        self.assertIn(("quota", "set", "alice", "--limit", "unlimited"), self.calls())
+        self.bot.handle({"callback_query": cq("q:y0:alice")})
+        self.assertIn(("quota", "set", "alice", "--days", "never"), self.calls())
+        self.bot.handle({"callback_query": cq("q:r:alice")})
+        self.assertIn(("quota", "reset", "alice"), self.calls())
+
+    def test_action_button_cycles(self):
+        self.bot.handle({"callback_query": cq("q:a:alice")})
+        self.assertIn(("quota", "set", "alice", "--action", "disable"), self.calls())
+        self.q("alice", action="notify")
+        self.bot.handle({"callback_query": cq("q:a:alice")})
+        self.assertIn(("quota", "set", "alice", "--action", "default"), self.calls())
+
+    def test_typed_limit_and_expiry(self):
+        self.bot.handle({"callback_query": cq("q:sl:alice")})
+        self.assertEqual(self.bot.awaiting[ADMIN], {"kind": "q_limit", "user": "alice"})
+        self.bot.on_message(self.msg("1.5T"))
+        self.assertIn(("quota", "set", "alice", "--limit", "1.5T"), self.calls())
+        self.bot.handle({"callback_query": cq("q:se:alice")})
+        self.bot.on_message(self.msg("2026-12-31"))
+        self.assertIn(("quota", "set", "alice", "--expires", "2026-12-31"), self.calls())
+
+    def test_bad_names_in_callbacks_are_ignored(self):
+        for d in ("q:g:../etc:5G", "q:r:a b", "u:k:x;y", "q:v:"):
+            self.bot.handle({"callback_query": cq(d)})
+        self.assertFalse([c for c in self.calls() if c[:1] == ("quota",) and len(c) > 1 and c[1] in ("add", "set", "reset")])
+
+    def test_wizard_creates_a_user_with_limits(self):
+        self.bot.handle({"callback_query": cq("a:add")})
+        self.bot.on_message(self.msg("carol"))
+        self.assertEqual(self.bot.wizard[ADMIN]["name"], "carol")
+        self.bot.handle({"callback_query": cq("w:l:20G")})
+        self.bot.handle({"callback_query": cq("w:d:30")})
+        self.bot.handle({"callback_query": cq("w:a")})            # default -> disable
+        self.bot.handle({"callback_query": cq("w:a")})            # -> delete
+        self.bot.handle({"callback_query": cq("w:go")})
+        add = [c for c in self.calls() if c[:2] == ("user", "add")][0]
+        self.assertEqual(add, ("user", "add", "carol", "--plain", "--limit", "20G", "--days", "30", "--action", "delete"))
+        self.assertNotIn(ADMIN, self.bot.wizard)
+
+    def test_wizard_custom_values_are_validated(self):
+        self.bot.handle({"callback_query": cq("a:add")})
+        self.bot.on_message(self.msg("carol"))
+        self.bot.handle({"callback_query": cq("w:l:c")})
+        self.bot.on_message(self.msg("lots"))
+        self.assertEqual(self.bot.wizard[ADMIN]["limit"], "unlimited", "the bad value was not taken")
+        self.assertIn(ADMIN, self.bot.awaiting, "still waiting for a valid value")
+        self.bot.on_message(self.msg("750M"))
+        self.assertEqual(self.bot.wizard[ADMIN]["limit"], "750m")
+        self.bot.handle({"callback_query": cq("w:d:c")})
+        self.bot.on_message(self.msg("2031-01-31"))
+        self.assertEqual(self.bot.wizard[ADMIN]["days"], "2031-01-31")
+
+    def test_wizard_starts_from_the_servers_defaults(self):
+        self.vpn.kv.update(default_limit="20G", default_days="30")
+        self.bot.handle({"callback_query": cq("a:add")})
+        self.bot.on_message(self.msg("carol"))
+        self.assertEqual((self.bot.wizard[ADMIN]["limit"], self.bot.wizard[ADMIN]["days"]), ("20G", "30"))
+
+    def test_invalid_or_existing_names_never_start_the_wizard(self):
+        self.bot.handle({"callback_query": cq("a:add")})
+        self.bot.on_message(self.msg("bad name!"))
+        self.assertNotIn(ADMIN, self.bot.wizard)
+        self.bot.handle({"callback_query": cq("a:add")})
+        self.bot.on_message(self.msg("alice"))
+        self.assertNotIn(ADMIN, self.bot.wizard)
+
+    def test_disconnect_button(self):
+        import ikev2lib as L
+        killed = []
+        orig = L.kick
+        L.kick = lambda n: killed.append(n) or 2
+        try:
+            self.bot.handle({"callback_query": cq("u:k:alice")})
+        finally:
+            L.kick = orig
+        self.assertEqual(killed, ["alice"])
+
+    def test_every_callback_fits_telegrams_64_byte_limit(self):
+        long = "a" * 32
+        open(os.path.join(self.tmp, "etc", "users.db"), "w").write(f"{long}:Pw:enabled:1\n")
+        self.bot.vpn = lambda *a, **k: (0, f"{long}|enabled|1") if a[:2] == ("user", "list") else self.vpn(*a, **k)
+        self.bot.show_users(None); self.bot.show_user(None, long); self.bot.show_quota_user(None, long); self.bot.show_quotas(None)
+        self.bot.start_wizard(long); self.bot.show_settings(None); self.bot.show_security(None); self.bot.show_server(None)
+        n = 0
+        for m in self.tg.methods("sendMessage"):
+            for row in (m.get("reply_markup") or {}).get("inline_keyboard", []):
+                for b in row:
+                    n += 1
+                    self.assertLessEqual(len(b["callback_data"].encode()), 64, b["callback_data"])
+        self.assertGreater(n, 30)
+
+    def test_alert_texts_and_buttons(self):
+        ev = self.bot.send_quota_event
+        ev({"kind": "warn_limit", "user": "alice", "used": 8 * 1024 ** 3, "limit": 10 * 1024 ** 3})
+        self.assertIn("80%", self.tg.methods("sendMessage")[-1]["text"])
+        ev({"kind": "limit", "user": "alice", "action": "disable", "used": 11, "limit": 10})
+        t = self.tg.methods("sendMessage")[-1]
+        self.assertIn("disabled", t["text"]); self.assertIn("q:v:alice", str(t["reply_markup"]))
+        ev({"kind": "expired", "user": "bob", "action": "delete"})
+        t = self.tg.methods("sendMessage")[-1]
+        self.assertIn("deleted", t["text"]); self.assertNotIn("reply_markup", t, "nothing to open for a deleted user")
+        ev({"kind": "limit", "user": "alice", "action": "notify", "used": 11, "limit": 10})
+        self.assertIn("notify only", self.tg.methods("sendMessage")[-1]["text"].replace("\\", ""))
+        n = len(self.tg.methods("sendMessage"))
+        ev({"kind": "nonsense", "user": "x"})
+        self.assertEqual(len(self.tg.methods("sendMessage")), n)
+
+    def test_quota_alerts_can_be_switched_off(self):
+        self.assertTrue(self.bot.load_state()["notify"]["quota"])
+        self.bot.handle({"callback_query": cq("n:t:quota")})
+        self.assertFalse(self.bot.load_state()["notify"]["quota"])
+
+
+class ServerTools(BotCase):
+    def setUp(self):
+        super().setUp()
+        self.bot.run_thread = lambda fn, *a: fn(*a)
+        self.calls = lambda: [c[0] for c in self.vpn.calls]
+        self.cb = lambda d: self.bot.handle({"callback_query": cq(d)})
+
+    def test_dangerous_actions_need_a_second_tap(self):
+        for first, then, cmd in (("se:fon", "se:fongo", ("fw", "on")), ("se:f2b", "se:f2bgo", ("security", "fail2ban")),
+                                 ("se:au", "se:augo", ("security", "autoupdate")), ("st:reset", "st:resetgo", ("reset", "--yes")),
+                                 ("sv:du", "sv:dugo", ("domain", "unset")), ("rw:c:extra", "rw:cgo:extra", ("raw", "clear", "extra"))):
+            self.cb(first)
+            self.assertNotIn(cmd, self.calls(), f"{first} must only ask")
+            self.cb(then)
+            self.assertIn(cmd, self.calls(), f"{then} must run it")
+
+    def test_simple_actions_map_to_cli_commands(self):
+        for d, cmd in (("se:foff", ("fw", "off")), ("se:fs", ("fw", "status")), ("sv:cr", ("cert", "renew")),
+                       ("sv:cf", ("cert", "renew", "--force")), ("sv:ir", ("ip", "refresh")), ("st:apply", ("conf", "apply")),
+                       ("st:pi:strict-sha2", ("preset", "ike", "strict-sha2")), ("sv:st", ("selftest",))):
+            self.cb(d)
+            self.assertIn(cmd, self.calls(), d)
+
+    def test_settings_roundtrip(self):
+        self.cb("st:m")
+        self.assertIn("DNS", str(self.shown()))
+        self.cb("st:v:MOBIKE:no")
+        self.assertIn(("set", "MOBIKE", "no"), self.calls())
+        self.cb("st:d:DNS")
+        self.assertIn(("set", "DNS", "default"), self.calls())
+        self.cb("st:e:DNS")
+        self.assertEqual(self.bot.awaiting[ADMIN], {"kind": "set", "key": "DNS"})
+        self.bot.on_message(self.msg("9.9.9.9"))
+        self.assertIn(("set", "DNS", "9.9.9.9"), self.calls())
+
+    def test_unknown_setting_keys_are_ignored(self):
+        self.cb("st:v:EVIL:x"); self.cb("st:d:EVIL"); self.cb("st:e:EVIL")
+        self.assertFalse([c for c in self.calls() if c[:1] == ("set",)])
+
+    def test_a_typed_value_is_a_single_argument(self):
+        self.cb("st:e:DNS")
+        self.bot.on_message(self.msg("1.1.1.1 ; reboot"))
+        call = [c for c in self.calls() if c[:2] == ("set", "DNS")][0]
+        self.assertEqual(call, ("set", "DNS", "1.1.1.1 ; reboot"))
+
+    def test_domain_flow_asks_before_switching(self):
+        self.cb("sv:ds")
+        self.bot.on_message(self.msg("vpn.example.com me@example.com"))
+        self.assertNotIn(("domain", "set", "vpn.example.com", "me@example.com"), self.calls())
+        self.cb("sv:dgo")
+        self.assertIn(("domain", "set", "vpn.example.com", "me@example.com"), self.calls())
+        self.cb("sv:ds")
+        self.bot.on_message(self.msg("not a domain"))
+        self.assertNotIn(ADMIN, self.bot.pending)
+
+    def test_firewall_ports_and_raw_snippets(self):
+        self.cb("se:fp")
+        self.bot.on_message(self.msg("22 2222"))
+        self.assertIn(("fw", "ports", "22 2222"), self.calls())
+        self.cb("rw:e:connection")
+        self.bot.on_message(self.msg("reauth_time = 24h"))
+        call = [c for c in self.vpn.calls if c[0] == ("raw", "set", "connection")][0]
+        self.assertEqual(call[1], "reauth_time = 24h\n", "the snippet goes through stdin")
+        self.cb("rw:v:../../etc"); self.cb("rw:cgo:bogus")
+        self.assertFalse([c for c in self.calls() if c[:2] in (("raw", "clear"),) and c[2] == "bogus"])
+
+    def test_restore_lists_only_plain_archives_and_confirms(self):
+        d = os.path.join(self.tmp, "bak")
+        for n in ("ikev2-backup-1.tar.gz", "ikev2-backup-2.tar.gz.enc"):
+            open(os.path.join(d, n), "w").write("x")
+        self.cb("b:rs")
+        text = str(self.shown()["reply_markup"])
+        self.assertIn("b:r:0", text); self.assertNotIn("b:r:1", text); self.assertNotIn("enc", text)
+        self.cb("b:r:0")
+        self.assertFalse([c for c in self.calls() if c[:1] == ("restore",)], "needs the second tap")
+        self.cb("b:rgo:0")
+        self.assertEqual([c for c in self.calls() if c[:1] == ("restore",)], [("restore", os.path.join(d, "ikev2-backup-1.tar.gz"))])
+        self.cb("b:rgo:7")
+        self.assertEqual(len([c for c in self.calls() if c[:1] == ("restore",)]), 1)
+
+    def test_nothing_in_the_new_menus_can_uninstall_or_expose_the_backup_key(self):
+        src = open(os.path.join(ROOT, "bot.py"), encoding="utf-8").read()
+        for bad in ('"uninstall"', '"backup", "key"', "'uninstall'"):
+            self.assertNotIn(bad, src)
+
+    def test_logs_and_certificate_views(self):
+        self.cb("sv:lg"); self.cb("sv:bl"); self.cb("sv:ce"); self.cb("sv:m"); self.cb("se:m"); self.cb("sv:dm")
+        self.assertIn(("logs", "40"), self.calls()); self.assertIn(("bot", "logs", "40"), self.calls())
+        self.assertIn(("cert", "info"), self.calls())
+
+
+class PersianScreens(BotCase):
+    def test_every_screen_renders_in_both_languages(self):
+        self.bot.run_thread = lambda fn, *a: fn(*a)
+        open(os.path.join(self.tmp, "etc", "users.db"), "w").write("alice:Pw:enabled:1\n")
+        self.bot.vpn = lambda *a, **k: (0, "alice|enabled|1") if a[:2] == ("user", "list") else self.vpn(*a, **k)
+        for lang in ("fa", "en"):
+            self.bot.update_state(lambda st, lang=lang: st.__setitem__("lang", lang))
+            self.tg.calls.clear()
+            for fn in (self.bot.show_main, self.bot.show_users, self.bot.show_quotas, self.bot.show_server, self.bot.show_security,
+                       self.bot.show_settings, self.bot.show_notify, self.bot.show_address, self.bot.show_cert):
+                fn(None)
+            self.bot.show_user(None, "alice"); self.bot.show_quota_user(None, "alice"); self.bot.start_wizard("carol")
+            for d in ("sv:lg", "sv:st", "se:fon", "st:reset", "st:ike", "rw:m", "rw:v:extra", "b:rs", "w:a", "q:a:alice"):
+                self.bot.handle({"callback_query": cq(d)})
+            for ev in ({"kind": "warn_limit", "user": "alice", "used": 8, "limit": 10}, {"kind": "warn_expiry", "user": "alice", "expires": 1},
+                       {"kind": "limit", "user": "alice", "action": "delete"}, {"kind": "expired", "user": "alice", "action": "notify"}):
+                self.bot.send_quota_event(ev)
+            self.assertGreater(len(self.tg.calls), 20, lang)
+            persian = sum(1 for ch in str(self.tg.calls) if "\u0600" <= ch <= "\u06ff")
+            if lang == "fa":
+                self.assertGreater(persian, 500)
+            else:
+                self.assertLess(persian, 20, "English mode: only the language-switch button is Persian")
 
 
 if __name__ == "__main__":
