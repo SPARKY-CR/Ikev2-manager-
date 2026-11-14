@@ -321,12 +321,92 @@ class Texts(BotCase):
 class ParsingHelpers(BotCase):
     def test_kv_status_and_users(self):
         self.assertEqual(self.bot.kv_status()["version"], "9.9.9")
-        orig = self.vpn.__call__
-
-        def users(*a, **k):
-            return (0, "alice|enabled|1\nbob|disabled|2") if a[:2] == ("user", "list") else orig(*a, **k)
-        self.bot.vpn = users
+        open(os.path.join(self.tmp, "etc", "users.db"), "w").write("alice:Pw1:enabled:1\nbob:Pw2:disabled:2\nbroken\n")
+        self.vpn.calls.clear()
         self.assertEqual(self.bot.list_users(), [("alice", "enabled"), ("bob", "disabled")])
+        self.assertEqual(self.vpn.calls, [], "the user list is read from users.db, no vpn process")
+        self.assertEqual(self.bot.user_password("bob"), "Pw2")
+        self.assertEqual(self.bot.user_password("nobody"), "")
+
+
+class Responsiveness(BotCase):
+    def setUp(self):
+        super().setUp()
+        self.n = lambda: len([c for c in self.vpn.calls if c[0] == ("status", "--kv")])
+        self.bot.drop_caches()
+        self.vpn.calls.clear()
+
+    def test_menus_open_instantly_from_a_stale_status_and_refresh_in_the_background(self):
+        self.bot.kv_status()
+        self.assertEqual(self.n(), 1)
+        self.bot._kv_cache["at"] -= 100                       # older than the 10 s TTL, younger than the stale limit
+        started = []
+        real = self.bot.threading.Thread
+        self.bot.threading.Thread = lambda target=None, **k: type("T", (), {"start": lambda s: started.append(target)})()
+        try:
+            self.assertEqual(self.bot.kv_status()["version"], "9.9.9")
+            self.bot.kv_status()
+        finally:
+            self.bot.threading.Thread = real
+        self.assertEqual(self.n(), 1, "no blocking re-read for a menu")
+        self.assertEqual(len(started), 1, "exactly one background refresh at a time")
+        started[0]()
+        self.assertEqual(self.n(), 2)
+        self.assertFalse(self.bot._kv_refreshing.is_set())
+
+    def test_very_old_or_forced_or_max_age_reads_block(self):
+        self.bot.kv_status()
+        self.bot._kv_cache["at"] -= 1000
+        self.bot.kv_status(); self.assertEqual(self.n(), 2, "older than the stale limit")
+        self.bot.kv_status(force=True); self.assertEqual(self.n(), 3)
+        self.bot._kv_cache["at"] -= 20
+        self.bot.kv_status(max_age=3); self.assertEqual(self.n(), 4, "the status screen wants a fresh copy")
+        self.bot.kv_status(max_age=3); self.assertEqual(self.n(), 4, "...but not on every tap")
+
+    def test_a_refresh_started_before_an_operation_cannot_store_old_data(self):
+        orig = self.bot.vpn
+
+        def slow(*a, **k):
+            self.bot.drop_caches()                            # an operation finishes while the status is being read
+            return orig(*a, **k)
+        self.bot.vpn = slow
+        self.bot._kv_fetch()
+        self.assertEqual(self.bot._kv_cache["data"], {}, "the old answer is discarded")
+
+    def test_language_is_not_read_from_disk_for_every_label(self):
+        reads = []
+        orig = self.bot.load_state
+        self.bot.load_state = lambda: reads.append(1) or orig()
+        for _ in range(50):
+            self.bot.tr("b_users")
+        self.assertLessEqual(len(reads), 1)
+        self.bot.update_state(lambda st: st.__setitem__("lang", "fa"))
+        self.assertEqual(self.bot.tr("b_users"), self.bot.T["fa"]["b_users"], "a language change is seen at once")
+
+    def test_double_tap_runs_once_but_is_acknowledged(self):
+        seen = []
+        self.bot.handle = lambda u: seen.append(u)
+        self.bot._recent_taps.clear()
+        u = {"callback_query": {"id": "7", "data": "u:d:alice", "message": {"message_id": 5}}}
+        self.bot.dispatch(u); self.bot.dispatch(u)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual([d for m, d in self.tg.calls if m == "answerCallbackQuery"], [{"callback_query_id": "7"}])
+        self.bot.dispatch({"callback_query": {"id": "8", "data": "u:l", "message": {"message_id": 5}}})
+        self.assertEqual(len(seen), 2, "another button on the same message is not a double tap")
+
+    def test_a_failing_handler_does_not_kill_the_worker(self):
+        def boom(u):
+            raise RuntimeError("x")
+        self.bot.handle = boom
+        self.bot._recent_taps.clear()
+        self.bot.traceback.print_exc = lambda: None
+        self.bot.dispatch({"message": {}})
+
+    def test_settings_keys_are_validated_without_extra_vpn_calls(self):
+        self.bot.get_settings(); self.vpn.calls.clear()
+        for _ in range(5):
+            self.bot.setting_keys()
+        self.assertEqual(self.vpn.calls, [])
 
 
 def cq(data):

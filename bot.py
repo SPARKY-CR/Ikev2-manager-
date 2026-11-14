@@ -2,6 +2,7 @@
 """ikev2-manager Telegram bot - admin only, Persian/English, stdlib only. Messages are sent as Telegram MarkdownV2."""
 import html
 import http.client
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
@@ -428,6 +429,10 @@ def save_state(st):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(st, f)
         os.replace(tmp, STATE_FILE)
+        try:                                       # this process is the only writer: keep the language cache exact
+            _lang_cache.update(mtime=os.stat(STATE_FILE).st_mtime_ns, lang=st.get("lang", "fa"))
+        except OSError:
+            _lang_cache["mtime"] = None
 
 
 _rmw = threading.RLock()
@@ -442,8 +447,23 @@ def update_state(fn):
         return st
 
 
+_lang_cache = {"mtime": None, "lang": "fa"}
+
+
+def get_lang():
+    """The bot language. tr() runs dozens of times per screen, so the state file is only re-read when it changed."""
+    try:
+        m = os.stat(STATE_FILE).st_mtime_ns
+    except OSError:
+        m = None
+    if m != _lang_cache["mtime"] or m is None:
+        _lang_cache["lang"] = load_state()["lang"]
+        _lang_cache["mtime"] = m
+    return _lang_cache["lang"]
+
+
 def tr(_key, /, **kw):
-    lang = load_state()["lang"]
+    lang = get_lang()
     s = T.get(lang, T["en"]).get(_key)
     if not s and lang == "fa":
         s = TX_FA.get(_key)
@@ -532,22 +552,55 @@ _kv_cache = {"at": 0.0, "data": {}}   # every menu screen re-reads it, so cache 
 _kv_lock = threading.Lock()
 
 
-def kv_status(force=False):
-    """Server status as a dict. Cached for _KV_TTL seconds; force=True re-reads
-    (used right after an operation whose result the screen shows)."""
-    with _kv_lock:
-        if not force and _kv_cache["data"] and time.time() - _kv_cache["at"] < _KV_TTL:
-            return dict(_kv_cache["data"])
+_KV_STALE_MAX = 300   # a menu may show a status up to this old while a fresh one loads in the background
+_kv_refreshing = threading.Event()
+_kv_gen = [0]         # bumped by drop_caches(): an answer that was requested before it is out of date
+
+
+def _kv_fetch():
+    gen = _kv_gen[0]
     rc, out = vpn("status", "--kv", timeout=60)
     d = {}
     for line in out.splitlines():
         if "=" in line:
             k, v = line.split("=", 1)
             d[k.strip()] = v.strip()
-    with _kv_lock:
-        _kv_cache["at"] = time.time()
-        _kv_cache["data"] = d
-    return dict(d)
+    if d:
+        with _kv_lock:
+            if gen == _kv_gen[0]:
+                _kv_cache["at"] = time.time()
+                _kv_cache["data"] = d
+    return d
+
+
+def _kv_refresh_bg():
+    try:
+        _kv_fetch()
+    finally:
+        _kv_refreshing.clear()
+
+
+def kv_status(force=False, max_age=None):
+    """Server status as a dict.
+    - force=True always re-reads (the caller decides something from it, or just changed it).
+    - max_age=N re-reads (blocking) when the cached copy is older than N seconds.
+    - default: a menu must open instantly, so a cached copy up to _KV_STALE_MAX old is returned at once and,
+      when it is older than _KV_TTL, one background refresh is started for the next tap."""
+    if not force:
+        with _kv_lock:
+            data, age = _kv_cache["data"], time.time() - _kv_cache["at"]
+        if data:
+            if max_age is not None:
+                if age < max_age:
+                    return dict(data)
+            elif age < _KV_TTL:
+                return dict(data)
+            elif age < _KV_STALE_MAX:
+                if not _kv_refreshing.is_set():
+                    _kv_refreshing.set()
+                    threading.Thread(target=_kv_refresh_bg, daemon=True).start()
+                return dict(data)
+    return dict(_kv_fetch() or _kv_cache["data"])
 
 
 _ONLINE_TTL = 5       # `swanctl --list-sas` on every tap; 5 s is fresh enough for a screen
@@ -572,6 +625,7 @@ def drop_caches():
     """Forget the cached status/sessions after an operation that changes them
     (user add/del/toggle, restart, preset, restore, upgrade...)."""
     with _kv_lock:
+        _kv_gen[0] += 1
         _kv_cache["at"] = 0.0
         _kv_cache["data"] = {}
     with _online_lock:
@@ -580,14 +634,21 @@ def drop_caches():
 
 
 def list_users():
-    rc, out = vpn("user", "list", "--plain")
-    users = []
-    if rc == 0:
-        for line in out.splitlines():
-            parts = line.split("|")
-            if len(parts) >= 2 and parts[0]:
-                users.append((parts[0], parts[1]))
-    return users
+    """[(name, 'enabled'|'disabled')] straight from users.db - the bot runs as root, so no `vpn` process is needed."""
+    return list(L.users_status().items())
+
+
+def user_password(name):
+    """The user's password from users.db ('' when not found)."""
+    try:
+        with open(os.path.join(ETC, "users.db"), encoding="utf-8") as f:
+            for line in f:
+                p = line.rstrip("\n").split(":")
+                if len(p) == 4 and p[0] == name:
+                    return p[1]
+    except OSError:
+        pass
+    return ""
 
 
 def latest_backup(encrypted=False):
@@ -705,9 +766,23 @@ class TG:
                      f'Content-Type: application/octet-stream\r\n\r\n').encode())
         body.extend(content)
         body.extend(f"\r\n--{boundary}--\r\n".encode())
-        with self._lock:
-            return self._post(self._prefix + "sendDocument", bytes(body),
-                              {"Content-Type": f"multipart/form-data; boundary={boundary}"}, 120)
+        # An upload can take a while: it gets its own connection so it never blocks the quick calls of other taps.
+        conn = self._new_conn(120)
+        try:
+            conn.request("POST", self._prefix + "sendDocument", body=bytes(body),
+                         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+            data = conn.getresponse().read()
+            try:
+                return json.loads(data)
+            except ValueError:
+                return {"ok": False, "description": "bad Telegram response"}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "description": str(e)}
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 tg = None
@@ -855,19 +930,23 @@ def show_user(msg, name):
 
 def send_profiles(name, with_info=True):
     kv = kv_status()
-    rc, pw = vpn("user", "show", name)
-    password = ""
-    for line in pw.splitlines():
-        if line.startswith("Password:"):
-            password = line.split(":", 1)[1].strip()
+    password = user_password(name)
+    if not password:
+        rc, pw = vpn("user", "show", name)
+        for line in pw.splitlines():
+            if line.startswith("Password:"):
+                password = line.split(":", 1)[1].strip()
     tmp = tempfile.mkdtemp(prefix="ikev2-prof-")
     try:
-        rc, out = vpn("profile", name, tmp)
+        with ThreadPoolExecutor(max_workers=2) as ex:           # both only read the user, so they can overlap
+            f_prof = ex.submit(vpn, "profile", name, tmp)
+            f_zed = ex.submit(vpn, "zed", name)
+            rc, out = f_prof.result()
+            rcz, zl = f_zed.result()
         if rc != 0:
             send(tr("err", err=esc(out[-800:]))); return
         if with_info:
             send_secret(tr("conn_info", server=esc(kv.get("server", "")), user=esc(name), pw=esc(password)))
-        rcz, zl = vpn("zed", name)
         if rcz == 0 and zl.startswith("zedsecure://"):
             send_secret(tr("zed_link", link=esc(zl)))
         send(tr("sending_files"))
@@ -917,7 +996,7 @@ def cert_text(kv):
 
 
 def show_status(msg):
-    kv = kv_status()
+    kv = kv_status(max_age=3)
     svc = kv.get("service", "?")
     edit(msg, tr("status", svc=("✅ " if svc == "active" else "🚨 ") + esc(svc), users=kv.get("users", "?"),
                  enabled=kv.get("enabled", "?"), online=kv.get("online", "?"), cert=cert_text(kv),
@@ -1429,14 +1508,26 @@ def cb_security(msg, p):
 
 
 # ---- advanced settings
-def get_settings():
+_settings_cache = {"at": 0.0, "items": []}
+
+
+def get_settings(max_age=10):
+    """[(KEY, value)] from `vpn get`, cached for a few seconds (cleared when a setting changes)."""
+    if _settings_cache["items"] and time.time() - _settings_cache["at"] < max_age:
+        return list(_settings_cache["items"])
     rc, out = vpn("get", timeout=60)
     items = []
     for line in clean(out).splitlines()[1:]:
         m = re.match(r"^([A-Z][A-Z0-9_]*)\s+(.*)$", line)
         if m:
             items.append((m.group(1), m.group(2).replace("  [default]", "")))
-    return items
+    _settings_cache.update(at=time.time(), items=items)
+    return list(items)
+
+
+def setting_keys():
+    """The names of the settings: they never change at runtime, so a stale list is fine for validating a tap."""
+    return [k for k, _ in (_settings_cache["items"] or get_settings())]
 
 
 def show_settings(msg):
@@ -1472,6 +1563,7 @@ def apply_setting(msg, key, value):
     if msg:
         edit(msg, tr("op_running", label=esc(key)))
     rc, out = vpn("set", key, value, timeout=300)
+    _settings_cache["at"] = 0.0
     if rc == 0:
         drop_caches()
     edit(msg, tr("st_set" if rc == 0 else "st_fail", key=esc(key), out=pre(out)),
@@ -1497,7 +1589,7 @@ def send_config(msg):
 def cb_settings(msg, p):
     sub = p[1] if len(p) > 1 else "m"
     key = p[2] if len(p) > 2 else ""
-    keys = [k for k, _ in get_settings()] if sub in ("k", "e", "d", "v") else []
+    keys = setting_keys() if sub in ("k", "e", "d", "v") else []
     if sub in ("k", "e", "d", "v") and key not in keys:
         show_settings(msg); return True
     if sub == "k":
@@ -1942,6 +2034,38 @@ def notify_upgrade_result():
 
 
 # ----------------------------------------------------------------- main
+_recent_taps = {}
+_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="tap")
+
+
+def is_double_tap(update):
+    """The same button on the same message within a second is an accidental double tap: the second one is only
+    acknowledged (so its spinner stops), never run twice (it could create / delete / toggle twice)."""
+    cqd = update.get("callback_query")
+    if not cqd:
+        return False
+    key = ((cqd.get("message") or {}).get("message_id"), cqd.get("data"))
+    now = time.time()
+    for k in [k for k, t in _recent_taps.items() if now - t > 5]:
+        _recent_taps.pop(k, None)
+    if now - _recent_taps.get(key, 0) < 1.0:
+        return True
+    _recent_taps[key] = now
+    return False
+
+
+def dispatch(update):
+    """Handle one update on a worker thread: a slow command (restart, backup, certificate...) must not make every
+    other tap wait behind it."""
+    try:
+        if is_double_tap(update):
+            tg.call("answerCallbackQuery", {"callback_query_id": update["callback_query"]["id"]})
+            return
+        handle(update)
+    except Exception:
+        traceback.print_exc()
+
+
 def main():
     global tg, ADMIN
     cfg = read_conf()
@@ -1957,6 +2081,7 @@ def main():
     me = tg.call("getMe")
     print("Bot started:", me.get("result", {}).get("username", "?"), flush=True)
     threading.Thread(target=monitor, daemon=True).start()
+    threading.Thread(target=kv_status, kwargs={"force": True}, daemon=True).start()     # warm the status cache
     notify_upgrade_result()
     offset = 0
     while True:
@@ -1967,10 +2092,7 @@ def main():
             continue
         for u in r.get("result", []):
             offset = u["update_id"] + 1
-            try:
-                handle(u)
-            except Exception:
-                traceback.print_exc()
+            _pool.submit(dispatch, u)
 
 
 if __name__ == "__main__":

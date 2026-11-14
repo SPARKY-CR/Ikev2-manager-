@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.4.2 - bot: no more waiting on small taps
+
+### Fixed
+- **Every label looked the language up on disk.** `tr()` re-read and parsed the state file for each button and
+  line (dozens per screen). The language is now cached and re-read only when the file changes.
+- **The user list ran a `vpn` process on every screen.** The bot now reads `users.db` directly (it runs as root); the
+  profile screen reads the password from the file and builds the profile and the ZedSecure link in parallel.
+- **Menus waited for `vpn status`.** Menus now open instantly from the last known status (up to 5 minutes old) and refresh
+  it in the background; the Status screen still re-reads when its copy is older than 3 s, and anything that changes the
+  status (restart, settings, users...) still forces a fresh read. A refresh that started before such an operation can no
+  longer store its old answer afterwards.
+- **One slow tap blocked all others.** Updates are now handled on a pool of worker threads, an accidental double tap on the
+  same button within a second is only acknowledged (so a user is never created, deleted or toggled twice), and file uploads
+  use their own connection so a large upload no longer delays the quick calls.
+- Settings: the list of setting names is cached, so opening a setting no longer runs `vpn get` twice.
+
 ## 1.4.1 - faster Telegram bot
 
 ### Fixed

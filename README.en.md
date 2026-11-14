@@ -293,3 +293,11 @@ handshake per call, the server status and online sessions are cached for a few s
 buttons (restart, DNS preset, user enable/disable/delete, quota buttons) run in the background
 instead of blocking the next tap. Screens stay correct: the cache is dropped after any operation
 that changes the status.
+
+
+## Bot: no more waiting on small taps (1.4.2)
+
+Menus open instantly from the last known status (refreshed in the background), the language is no
+longer re-read from disk for every label, the user list is read straight from `users.db`, and
+updates are handled on a pool of worker threads, so one slow tap never blocks the others. An
+accidental double tap on the same button within a second is only acknowledged, never run twice.
