@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.4.1 - faster Telegram bot
+
+### Fixed
+- **The Telegram bot felt slow.** Every tap re-ran `vpn status` (which spawns ~8 processes) and every
+  Telegram call opened a fresh TLS connection, and several buttons (restart, DNS preset, user
+  enable/disable/delete, quota buttons) ran their slow command on the poll thread, blocking every
+  other tap behind them. The bot now: reuses one keep-alive HTTPS connection to Telegram (with one
+  retry when the server closed it while idle), caches the server status for 10 s and the online
+  sessions for 5 s, and runs the slow buttons in worker threads. Screens stay correct: the cache is
+  dropped after any operation that changes the status (user, settings, certificate, firewall,
+  domain, restore, upgrade), and the backup-key check always reads fresh because it decides
+  encrypted vs plain backup.
+
 ## 1.4.0 - traffic limit, expiry and a full-featured Telegram bot
 
 ### Added

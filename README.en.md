@@ -284,3 +284,12 @@ vpn set DEFAULT_LIMIT 20G; vpn set DEFAULT_DAYS 30; vpn set QUOTA_ACTION disable
 ```
 Sizes: `500M`, `10G`, `1.5T` (a bare number means GB), `unlimited`. Expiry: days from now, `YYYY-MM-DD` or `never`.
 A timer checks every 20 s, so enforcement can lag by that much. The Telegram bot offers all of this with buttons.
+
+
+## Faster Telegram bot (1.4.1)
+
+The bot answers faster: Telegram calls reuse one keep-alive connection instead of a fresh TLS
+handshake per call, the server status and online sessions are cached for a few seconds, and slow
+buttons (restart, DNS preset, user enable/disable/delete, quota buttons) run in the background
+instead of blocking the next tap. Screens stay correct: the cache is dropped after any operation
+that changes the status.

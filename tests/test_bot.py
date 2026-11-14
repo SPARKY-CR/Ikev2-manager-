@@ -78,6 +78,7 @@ class BotCase(unittest.TestCase):
         self.vpn = FakeVpn()
         self.bot.vpn = self.vpn
         self.tg = self.bot.tg
+        self.bot.run_thread = lambda fn, *a: fn(*a)   # run the worker threads inline: deterministic
         self.bot.update_state(lambda st: st.__setitem__("lang", "en"))     # the bot defaults to Persian
 
     def shown(self):
@@ -679,6 +680,97 @@ class PersianScreens(BotCase):
                 self.assertGreater(persian, 500)
             else:
                 self.assertLess(persian, 20, "English mode: only the language-switch button is Persian")
+
+
+class Speed(BotCase):
+    def _status_calls(self):
+        return [c for c in self.vpn.calls if c[0][:2] == ("status", "--kv")]
+
+    def test_status_is_cached_for_a_while_and_force_refreshes(self):
+        self.assertEqual(self.bot.kv_status()["version"], "9.9.9")
+        self.assertEqual(self.bot.kv_status()["version"], "9.9.9")
+        self.assertEqual(len(self._status_calls()), 1, "the second read comes from the cache")
+        d = self.bot.kv_status()
+        d["version"] = "tampered"
+        self.assertEqual(self.bot.kv_status()["version"], "9.9.9", "callers cannot poison the cache")
+        self.vpn.kv["version"] = "1.2.3"
+        self.assertEqual(self.bot.kv_status()["version"], "9.9.9", "still cached")
+        self.assertEqual(self.bot.kv_status(force=True)["version"], "1.2.3")
+        self.assertEqual(len(self._status_calls()), 2)
+
+    def test_a_failed_status_read_is_not_cached(self):
+        self.bot.vpn = lambda *a, **k: (1, "boom")
+        self.assertEqual(self.bot.kv_status(), {})
+        self.assertEqual(self.bot.kv_status(), {})
+        # no cache entry was kept: a fixed CLI is picked up right away
+        self.bot.vpn = self.vpn
+        self.assertEqual(self.bot.kv_status()["version"], "9.9.9")
+
+    def test_online_sessions_are_cached_and_dropped(self):
+        seen = []
+        orig = self.bot.L.online
+        try:
+            self.bot.L.online = lambda: seen.append(1) or [{"user": "alice", "id": 7}]
+            self.assertEqual(len(self.bot.online_cached()), 1)
+            self.assertEqual(len(self.bot.online_cached()), 1)
+            self.assertEqual(len(seen), 1, "the second read comes from the cache")
+            self.bot.drop_caches()
+            self.assertEqual(len(self.bot.online_cached()), 1)
+            self.assertEqual(len(seen), 2)
+            self.bot._online_cache["at"] = 0      # pretend the TTL expired
+            self.assertEqual(len(self.bot.online_cached()), 1)
+            self.assertEqual(len(seen), 3)
+        finally:
+            self.bot.L.online = orig
+
+    def _local_tg(self, close_first=False):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        connections, state = [], {"close_first": close_first}
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def setup(self):
+                super().setup()
+                connections.append(1)
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(n)
+                body = b'{"ok": true, "result": true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                if state["close_first"]:
+                    state["close_first"] = False
+                    self.send_header("Connection", "close")
+                    self.close_connection = True
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        self.addCleanup(srv.server_close)
+        tg = self.bot.TG("TOKEN", base=f"http://127.0.0.1:{srv.server_address[1]}/botTOKEN/")
+        return tg, connections
+
+    def test_telegram_calls_share_one_connection(self):
+        tg, connections = self._local_tg()
+        self.assertTrue(tg.call("sendMessage", {"chat_id": 1, "text": "hi"})["ok"])
+        self.assertTrue(tg.call("sendMessage", {"chat_id": 1, "text": "hi"})["ok"])
+        self.assertEqual(len(connections), 1, "both calls reuse one keep-alive connection")
+
+    def test_a_closed_connection_is_retried_once(self):
+        tg, connections = self._local_tg(close_first=True)
+        self.assertTrue(tg.call("sendMessage", {"chat_id": 1, "text": "hi"})["ok"])
+        self.assertTrue(tg.call("sendMessage", {"chat_id": 1, "text": "hi"})["ok"],
+                        "the server closed the idle connection; the call must still go through")
+        self.assertEqual(len(connections), 2, "one retry on a fresh connection")
 
 
 if __name__ == "__main__":

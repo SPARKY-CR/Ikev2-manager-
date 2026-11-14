@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """ikev2-manager Telegram bot - admin only, Persian/English, stdlib only. Messages are sent as Telegram MarkdownV2."""
 import html
+import http.client
 import json
 import os
 import re
@@ -14,6 +15,7 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
+from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ikev2lib as L  # noqa: E402
@@ -525,14 +527,56 @@ def vpn(*args, timeout=180, input_text=None):
         return 1, str(e)
 
 
-def kv_status():
+_KV_TTL = 10          # `vpn status` spawns ~8 processes (systemctl, python, swanctl, openssl...);
+_kv_cache = {"at": 0.0, "data": {}}   # every menu screen re-reads it, so cache it briefly
+_kv_lock = threading.Lock()
+
+
+def kv_status(force=False):
+    """Server status as a dict. Cached for _KV_TTL seconds; force=True re-reads
+    (used right after an operation whose result the screen shows)."""
+    with _kv_lock:
+        if not force and _kv_cache["data"] and time.time() - _kv_cache["at"] < _KV_TTL:
+            return dict(_kv_cache["data"])
     rc, out = vpn("status", "--kv", timeout=60)
     d = {}
     for line in out.splitlines():
         if "=" in line:
             k, v = line.split("=", 1)
             d[k.strip()] = v.strip()
-    return d
+    with _kv_lock:
+        _kv_cache["at"] = time.time()
+        _kv_cache["data"] = d
+    return dict(d)
+
+
+_ONLINE_TTL = 5       # `swanctl --list-sas` on every tap; 5 s is fresh enough for a screen
+_online_cache = {"at": 0.0, "data": None}
+_online_lock = threading.Lock()
+
+
+def online_cached():
+    """Online sessions, cached briefly. Display paths only; kick() still
+    queries swanctl directly so it always terminates the current sessions."""
+    with _online_lock:
+        if _online_cache["data"] is not None and time.time() - _online_cache["at"] < _ONLINE_TTL:
+            return list(_online_cache["data"])
+    sas = L.online()
+    with _online_lock:
+        _online_cache["at"] = time.time()
+        _online_cache["data"] = sas
+    return list(sas)
+
+
+def drop_caches():
+    """Forget the cached status/sessions after an operation that changes them
+    (user add/del/toggle, restart, preset, restore, upgrade...)."""
+    with _kv_lock:
+        _kv_cache["at"] = 0.0
+        _kv_cache["data"] = {}
+    with _online_lock:
+        _online_cache["at"] = 0.0
+        _online_cache["data"] = None
 
 
 def list_users():
@@ -558,30 +602,91 @@ def latest_backup(encrypted=False):
 
 
 def backup_key_on():
-    return kv_status().get("backup_key") == "yes"
+    # A decision, not a display value (it picks encrypted vs plain backup),
+    # so it always reads fresh instead of using the cached status.
+    return kv_status(force=True).get("backup_key") == "yes"
 
 
 # ----------------------------------------------------------------- telegram API
 class TG:
-    def __init__(self, token):
+    """Telegram API client. Short calls share one keep-alive HTTPS connection.
+
+    Every call used to open a fresh TLS connection; on a slow route to
+    api.telegram.org that handshake dominated each tap. Short calls (send,
+    edit, answer, delete) now reuse one connection, guarded by a lock because
+    the monitor and worker threads call it too. A dead connection (the server
+    closed it while idle) is retried once on a fresh one. getUpdates keeps its
+    own connection: a 30 s long poll must never block the other calls.
+    """
+
+    def __init__(self, token, base=None):
         self.token = token
-        self.base = f"https://api.telegram.org/bot{token}/"
+        self.base = base or f"https://api.telegram.org/bot{token}/"
+        u = urlparse(self.base)
+        self._host = u.hostname
+        self._port = u.port or (443 if u.scheme == "https" else 80)
+        self._secure = u.scheme == "https"
+        self._prefix = u.path.rstrip("/") + "/"
+        self._conn = None
+        self._lock = threading.Lock()
+
+    def _new_conn(self, timeout):
+        cls = http.client.HTTPSConnection if self._secure else http.client.HTTPConnection
+        return cls(self._host, self._port, timeout=timeout)
+
+    def _drop_conn(self):
+        try:
+            if self._conn is not None:
+                self._conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self._conn = None
+
+    def _post(self, path, body, headers, timeout):
+        """One POST over the shared connection; retries once on a fresh one."""
+        last = None
+        for _ in range(2):
+            try:
+                if self._conn is None:
+                    self._conn = self._new_conn(timeout)
+                elif self._conn.sock is not None:
+                    self._conn.sock.settimeout(timeout)
+                self._conn.request("POST", path, body=body, headers=headers)
+                r = self._conn.getresponse()
+                data = r.read()
+                try:
+                    return json.loads(data)
+                except ValueError:
+                    return {"ok": False, "description": "bad Telegram response"}
+            except (http.client.HTTPException, OSError) as e:
+                # The connection broke before we got an answer (typically the
+                # server closed an idle one): drop it and try once more.
+                last = e
+                self._drop_conn()
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "description": str(e)}
+        return {"ok": False, "description": str(last)}
 
     def call(self, method, data=None, timeout=40):
-        req = urllib.request.Request(
-            self.base + method, data=json.dumps(data or {}).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.load(r)
-        except urllib.error.HTTPError as e:
+        if method == "getUpdates":
+            req = urllib.request.Request(
+                self.base + method, data=json.dumps(data or {}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
             try:
-                return json.load(e)
-            except Exception:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    return json.load(r)
+            except urllib.error.HTTPError as e:
+                try:
+                    return json.load(e)
+                except Exception:
+                    return {"ok": False, "description": str(e)}
+            except Exception as e:  # noqa: BLE001
                 return {"ok": False, "description": str(e)}
-        except Exception as e:  # noqa: BLE001
-            return {"ok": False, "description": str(e)}
+        body = json.dumps(data or {}).encode()
+        with self._lock:
+            return self._post(self._prefix + method, body,
+                              {"Content-Type": "application/json"}, timeout)
 
     def send_document(self, chat_id, path, caption=None):
         boundary = uuid.uuid4().hex
@@ -600,15 +705,9 @@ class TG:
                      f'Content-Type: application/octet-stream\r\n\r\n').encode())
         body.extend(content)
         body.extend(f"\r\n--{boundary}--\r\n".encode())
-        req = urllib.request.Request(
-            self.base + "sendDocument", data=bytes(body),
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=120) as r:
-                return json.load(r)
-        except Exception as e:  # noqa: BLE001
-            return {"ok": False, "description": str(e)}
+        with self._lock:
+            return self._post(self._prefix + "sendDocument", bytes(body),
+                              {"Content-Type": f"multipart/form-data; boundary={boundary}"}, 120)
 
 
 tg = None
@@ -741,7 +840,7 @@ def show_user(msg, name):
     if name not in users:
         show_users(msg); return
     enabled = users[name] == "enabled"
-    sas = [s for s in L.online() if s["user"] == name]
+    sas = [s for s in online_cached() if s["user"] == name]
     online = tr("yes") + f" ({len(sas)})" if sas else tr("no")
     text = tr("user_view", user=esc(name), state=tr("st_on" if enabled else "st_off"), online=online)
     text += "\n" + quota_block(qrec(name))
@@ -799,6 +898,7 @@ def do_create_user(name, limit=None, days=None, action=None):
     rc, out = vpn(*args)
     if rc != 0:
         send(tr("err", err=esc(out[-800:]))); return
+    drop_caches()
     send(tr("created", user=esc(name)) + "\n" + quota_block(qrec(name)))
     send_profiles(name)
 
@@ -826,7 +926,7 @@ def show_status(msg):
 
 
 def show_online(msg):
-    sas = L.online()
+    sas = online_cached()
     if not sas:
         edit(msg, tr("no_online"), kb([[(tr("b_online"), "s:on")], back_row()])); return
     lines = [tr("online_title", n=len(sas))]
@@ -875,6 +975,8 @@ def show_notify(msg):
 def job_strongswan():
     send(tr("upd_sw_running"))
     rc, out = vpn("upgrade-strongswan", timeout=1800)
+    if rc == 0:
+        drop_caches()
     out = re.sub(r"\x1b\[[0-9;]*m", "", out)
     send(("✅ " if rc == 0 else "❌ ") + f"<code>{esc(out[-1500:])}</code>", kb([back_row()]))
 
@@ -1025,6 +1127,8 @@ def run_op(msg, label, args, back_cb, timeout=180, input_text=None):
     if msg:
         edit(msg, tr("op_running", label=label))
     rc, out = vpn(*args, timeout=timeout, input_text=input_text)
+    if rc == 0:
+        drop_caches()
     edit(msg, tr("op_ok" if rc == 0 else "op_fail", label=label, out=pre(out)),
          kb([[(tr("b_back"), back_cb)], back_row()]))
     return rc
@@ -1102,18 +1206,18 @@ def cb_quota(msg, p):
     if sub == "v":
         show_quota_user(msg, name)
     elif sub == "g" and len(p) > 3:
-        quota_cmd(msg, name, "add", name, "--limit", p[3])
+        run_thread(quota_cmd, msg, name, "add", name, "--limit", p[3])
     elif sub == "y" and len(p) > 3:
-        quota_cmd(msg, name, "add", name, "--days", p[3])
+        run_thread(quota_cmd, msg, name, "add", name, "--days", p[3])
     elif sub == "g0":
-        quota_cmd(msg, name, "set", name, "--limit", "unlimited")
+        run_thread(quota_cmd, msg, name, "set", name, "--limit", "unlimited")
     elif sub == "y0":
-        quota_cmd(msg, name, "set", name, "--days", "never")
+        run_thread(quota_cmd, msg, name, "set", name, "--days", "never")
     elif sub == "a":
         cur = qrec(name)["action"]
-        quota_cmd(msg, name, "set", name, "--action", ACTIONS[(ACTIONS.index(cur) + 1) % len(ACTIONS)])
+        run_thread(quota_cmd, msg, name, "set", name, "--action", ACTIONS[(ACTIONS.index(cur) + 1) % len(ACTIONS)])
     elif sub == "r":
-        quota_cmd(msg, name, "reset", name)
+        run_thread(quota_cmd, msg, name, "reset", name)
     elif sub == "sl":
         awaiting[ADMIN] = {"kind": "q_limit", "user": name}
         edit(msg, tr("q_ask_limit", user=esc(name)), kb([[(tr("b_cancel"), f"q:v:{name}")]]))
@@ -1203,6 +1307,7 @@ def cb_wizard(msg, p):
 # ---- disconnect
 def kick_user(msg, name):
     n = L.kick(name)
+    drop_caches()
     send(tr("kicked", user=esc(name), n=n))
     show_user(msg, name)
 
@@ -1367,6 +1472,8 @@ def apply_setting(msg, key, value):
     if msg:
         edit(msg, tr("op_running", label=esc(key)))
     rc, out = vpn("set", key, value, timeout=300)
+    if rc == 0:
+        drop_caches()
     edit(msg, tr("st_set" if rc == 0 else "st_fail", key=esc(key), out=pre(out)),
          kb([[(tr("b_back"), f"st:k:{key}")], [(tr("b_settings"), "st:m")]]))
 
@@ -1410,6 +1517,8 @@ def cb_settings(msg, p):
     elif sub == "pi" and key in ("compat", "strict-sha2"):
         def job():
             rc, out = vpn("preset", "ike", key, timeout=300)
+            if rc == 0:
+                drop_caches()
             edit(msg, tr("st_ike_done", out=pre(out)) if rc == 0 else tr("op_fail", label=tr("lb_ike"), out=pre(out)),
                  kb([[(tr("b_back"), "st:m")]]))
         run_thread(job)
@@ -1452,8 +1561,11 @@ def cb_raw(msg, p):
     elif sub == "c":
         confirm(msg, tr("rw_clear_confirm", name=esc(name)), f"rw:cgo:{name}", f"rw:v:{name}")
     elif sub == "cgo":
-        rc, out = vpn("raw", "clear", name, timeout=300)
-        edit(msg, tr("rw_saved" if rc == 0 else "rw_failed", name=esc(name), out=pre(out)), kb([[(tr("b_back"), "rw:m")]]))
+        def job():
+            edit(msg, tr("op_running", label=tr("lb_raw", name=esc(name))))
+            rc, out = vpn("raw", "clear", name, timeout=300)
+            edit(msg, tr("rw_saved" if rc == 0 else "rw_failed", name=esc(name), out=pre(out)), kb([[(tr("b_back"), "rw:m")]]))
+        run_thread(job)
     return True
 
 
@@ -1487,6 +1599,8 @@ def cb_backup_ext(msg, p):
         def job():
             edit(msg, tr("op_running", label=tr("lb_restore")))
             rc, out = vpn("restore", path, timeout=900)
+            if rc == 0:
+                drop_caches()
             edit(msg, tr("bk_done" if rc == 0 else "bk_fail", out=pre(out)), kb([back_row()]))
         run_thread(job)
     else:
@@ -1542,10 +1656,7 @@ def on_text_ext(aw, text, msg):
     elif kind in ("q_limit", "q_exp"):
         awaiting.pop(ADMIN, None)
         flag = "--limit" if kind == "q_limit" else "--expires"
-        rc, out = vpn("quota", "set", aw["user"], flag, text)
-        out = clean(out)
-        note = tr("q_done" if rc == 0 else "q_fail", text=esc(out.splitlines()[0] if out else ""))
-        show_quota_user(None, aw["user"], note)
+        run_thread(quota_cmd, None, aw["user"], "set", aw["user"], flag, text)
     elif kind == "set":
         awaiting.pop(ADMIN, None)
         run_thread(apply_setting, None, aw["key"], text)
@@ -1593,7 +1704,7 @@ def on_message(msg):
         if rc != 0:
             send(tr("err", err=esc(out[-800:]))); return
         send(tr("pw_changed"))
-        send_profiles(name)
+        run_thread(send_profiles, name)
 
 
 def on_callback(cq):
@@ -1615,12 +1726,17 @@ def on_callback(cq):
         threading.Thread(target=send_profiles, args=(parts[2],), daemon=True).start()
     elif k == "u" and parts[1] == "t":
         name = parts[2]
-        cur = dict(list_users()).get(name)
-        new = "disable" if cur == "enabled" else "enable"
-        rc, out = vpn("user", new, name)
-        if rc != 0:
-            send(tr("err", err=esc(out[-800:])))
-        show_user(msg, name)
+
+        def job_toggle():
+            cur = dict(list_users()).get(name)
+            new = "disable" if cur == "enabled" else "enable"
+            rc, out = vpn("user", new, name)
+            if rc != 0:
+                send(tr("err", err=esc(out[-800:])))
+            else:
+                drop_caches()
+            show_user(msg, name)
+        run_thread(job_toggle)
     elif k == "u" and parts[1] == "w":
         awaiting[ADMIN] = {"kind": "passwd", "user": parts[2]}
         edit(msg, tr("ask_pw"), kb([[(tr("b_cancel"), f"u:v:{parts[2]}")]]))
@@ -1628,11 +1744,16 @@ def on_callback(cq):
         edit(msg, tr("confirm_del", user=esc(parts[2])),
              kb([[(tr("b_yes_del"), f"u:x:{parts[2]}"), (tr("b_cancel"), f"u:v:{parts[2]}")]]))
     elif k == "u" and parts[1] == "x":
-        rc, out = vpn("user", "del", parts[2])
-        if rc == 0:
-            edit(msg, tr("deleted", user=esc(parts[2])), kb([[(tr("b_users"), "u:l")], back_row()]))
-        else:
-            send(tr("err", err=esc(out[-800:])))
+        name = parts[2]
+
+        def job_delete():
+            rc, out = vpn("user", "del", name)
+            if rc == 0:
+                drop_caches()
+                edit(msg, tr("deleted", user=esc(name)), kb([[(tr("b_users"), "u:l")], back_row()]))
+            else:
+                send(tr("err", err=esc(out[-800:])))
+        run_thread(job_delete)
     elif data == "a:add":
         awaiting[ADMIN] = {"kind": "add"}
         edit(msg, tr("ask_name"), kb([back_row()]))
@@ -1643,10 +1764,13 @@ def on_callback(cq):
     elif data == "s:info":
         show_info(msg)
     elif data == "s:rs":
-        edit(msg, tr("restarting"))
-        rc, out = vpn("restart", timeout=120)
-        svc = kv_status().get("service", "?")
-        edit(msg, tr("restarted", svc=esc(svc)), kb([back_row()]))
+        def job_restart():
+            edit(msg, tr("restarting"))
+            rc, out = vpn("restart", timeout=120)
+            drop_caches()
+            svc = kv_status(force=True).get("service", "?")
+            edit(msg, tr("restarted", svc=esc(svc)), kb([back_row()]))
+        run_thread(job_restart)
     elif data == "b:m":
         show_backup(msg)
     elif data == "b:make":
@@ -1667,12 +1791,18 @@ def on_callback(cq):
     elif data == "d:m":
         show_dns(msg)
     elif k == "d" and parts[1] == "s":
-        rc, out = vpn("preset", "dns", parts[2], timeout=120)
-        kv = kv_status()
-        if rc == 0:
-            edit(msg, tr("dns_set", dns=esc(kv.get("dns", "?"))), kb([[(tr("b_dns"), "d:m")], back_row()]))
-        else:
-            send(tr("err", err=esc(re.sub(r"\x1b\[[0-9;]*m", "", out)[-600:])))
+        preset = parts[2]
+
+        def job_dns():
+            rc, out = vpn("preset", "dns", preset, timeout=120)
+            if rc == 0:
+                drop_caches()
+            kv = kv_status(force=True)
+            if rc == 0:
+                edit(msg, tr("dns_set", dns=esc(kv.get("dns", "?"))), kb([[(tr("b_dns"), "d:m")], back_row()]))
+            else:
+                send(tr("err", err=esc(re.sub(r"\x1b\[[0-9;]*m", "", out)[-600:])))
+        run_thread(job_dns)
     elif data == "n:m":
         show_notify(msg)
     elif k == "n" and parts[1] == "t":
@@ -1757,7 +1887,7 @@ def monitor():
             last_active = active
 
             if active and st["notify"]["conn"]:
-                cur = {(s["user"], s["id"]): s for s in L.online()}
+                cur = {(s["user"], s["id"]): s for s in online_cached()}
                 if last_sessions is not None:
                     for key, s in cur.items():
                         if key not in last_sessions:
